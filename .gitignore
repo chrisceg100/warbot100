@@ -1,24 +1,18 @@
-node_modules
-.env
-warbot.db
-*.log
-sa.json
-node_modules
-.env
-warbot.db
-*.log
-sa.json
-credentials/
-*.json
+# OS
 .DS_Store
+
+# Node
 node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Env & secrets
 .env
-warbot.db
 sa.json
 credentials/
-.DS_Store
-node_modules
-.env
+
+# SQLite
 warbot.db
-sa.json
-credentials/
+warbot.db-shm
+warbot.db-wal
