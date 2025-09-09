@@ -53,6 +53,9 @@ export function initDB() {
     );
   `);
 }
+export function getMaxWarId() {
+  return db.prepare(`SELECT IFNULL(MAX(id),0)+1 AS id FROM wars`).get()?.id || 1;
+}
 
 export function recordLockedWar({ warId, messageId, opponent, format, startET, starters, backups }) {
   const now = new Date().toISOString();
