@@ -1,18 +1,25 @@
-# OS
-.DS_Store
+cd ~/Desktop/warbot
 
+cat > .gitignore << 'EOF'
 # Node
-node_modules
+node_modules/
 npm-debug.log*
-yarn-debug.log*
 yarn-error.log*
+*.log
 
-# Env & secrets
+# Local config & secrets (never commit)
 .env
-sa.json
 credentials/
+*.json
 
-# SQLite
+# Local databases
 warbot.db
-warbot.db-shm
-warbot.db-wal
+warbot.db-*
+*.sqlite
+*.db
+
+# macOS cruft
+.DS_Store
+EOF
+
+cat .gitignore
