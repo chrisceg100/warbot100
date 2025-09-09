@@ -18,13 +18,19 @@ import {
   Events,
 } from 'discord.js';
 
-import { initDB } from './db.js';          // safe no-op if you haven't wired persistence yet
+import { initDB, getMaxWarId } from './db.js';          // safe no-op if you haven't wired persistence yet
 import { initSheets } from './sheets.js';  // safe no-op if you use a stub; keeps creds checked
+
+initDB();
+let nextWarId = await getMaxWarId();
 
 /* ============== IN-MEMORY STATE ============== */
 const wars = new Map(); // messageId -> war
+let nextWarId = 1;
 /*
-war = {
+war = { 
+  id: number,
+  channelId: string,
   teamSize: number,
   pool: Map<userId, { name, joinedISO }>,
   starters: string[],
@@ -93,9 +99,10 @@ async function updateSignupEmbed(msg) {
   const war = wars.get(msg.id);
   if (!war) return;
   const base = msg.embeds?.[0];
-  const embed = base ? EmbedBuilder.from(base) : new EmbedBuilder().setTitle('War Sign-up').setColor(0x2ecc71);
+const embed = base ? EmbedBuilder.from(base) : new EmbedBuilder().setColor(0x2ecc71);
+  embed.setTitle(`War Sign-up #${war.id}`);
 
-  const startersText = war.starters?.length
+    const startersText = war.starters?.length
     ? war.starters.map((id) => war.pool.get(id)?.name ?? `User ${id}`).join(', ')
     : '—';
   const backupsText = war.backups?.length
@@ -116,6 +123,15 @@ async function findLatestWarMessageInChannel(channel) {
   return msgs.find((m) => wars.has(m.id));
 }
 
+async function findWarMessageInChannelById(channel, warId) {
+  for (const [msgId, war] of wars.entries()) {
+    if (war.id === warId && war.channelId === channel.id) {
+      return channel.messages.fetch(msgId).catch(() => null);
+    }
+  }
+  return null;
+}
+
 /* ============== COMMANDS ============== */
 async function registerCommands() {
   const commands = [
@@ -124,9 +140,19 @@ async function registerCommands() {
       description: 'WarBot commands',
       options: [
         { type: 1, name: 'new', description: 'Create a new War Sign-up (dropdowns)' },
-        { type: 1, name: 'select', description: 'Pick roster (manual or auto-pick)' },
+        {
+          type: 1,
+          name: 'select',
+          description: 'Pick roster (manual or auto-pick)',
+          options: [{ type: 4, name: 'war', description: 'War ID', required: false }],
+        },
         { type: 1, name: 'help', description: 'Show WarBot help and quick reference' },
-        { type: 1, name: 'simulate', description: 'Admin: seed 10 fake signups (testing only)' },
+        {
+          type: 1,
+          name: 'simulate',
+          description: 'Admin: seed 10 fake signups (testing only)',
+          options: [{ type: 4, name: 'war', description: 'War ID', required: false }],
+        },
       ],
     },
   ];
@@ -141,7 +167,6 @@ async function registerCommands() {
 /* ============== READY ============== */
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  initDB();
   await initSheets();
   await registerCommands();
 });
@@ -166,7 +191,7 @@ client.on('interactionCreate', async (interaction) => {
               '',
               '**Admins / Managers / Captains**',
               '• `/warbot new` → dropdowns for team size & format → opponent → time.',
-              '• `/warbot select` → **Manual Pick** or **Auto-pick First N**; DMs go out; embed updates.',
+              '• `/warbot select [war]` → **Manual Pick** or **Auto-pick First N**; DMs go out; embed updates.',
               '• If a starter drops after lock, roster unlocks and admins are pinged to re-select.',
               '',
               '**Cancel**',
@@ -184,7 +209,10 @@ client.on('interactionCreate', async (interaction) => {
         if (!isAdminish(interaction.member)) {
           return interaction.reply({ ephemeral: true, content: 'No permission.' });
         }
-        const warMsg = await findLatestWarMessageInChannel(interaction.channel);
+        const idOpt = interaction.options.getInteger('war');
+        const warMsg = idOpt
+          ? await findWarMessageInChannelById(interaction.channel, idOpt)
+          : await findLatestWarMessageInChannel(interaction.channel);
         if (!warMsg) {
           return interaction.reply({ ephemeral: true, content: 'No active War Sign-up here. Run /warbot new first.' });
         }
@@ -242,7 +270,10 @@ client.on('interactionCreate', async (interaction) => {
         if (!isAdminish(interaction.member)) {
           return interaction.reply({ ephemeral: true, content: 'No permission.' });
         }
-        const warMsg = await findLatestWarMessageInChannel(interaction.channel);
+        const idOpt = interaction.options.getInteger('war');
+        const warMsg = idOpt
+          ? await findWarMessageInChannelById(interaction.channel, idOpt)
+          : await findLatestWarMessageInChannel(interaction.channel);
         if (!warMsg) {
           return interaction.reply({ ephemeral: true, content: 'No War Sign-up found in this channel.' });
         }
@@ -272,7 +303,7 @@ client.on('interactionCreate', async (interaction) => {
           '📖 **WarBot Full Tutorial**\n\n' +
           '1) `/warbot new` → choose team size & format, enter opponent, pick time.\n' +
           '2) Players react 👍 to join; unreact to drop.\n' +
-          '3) `/warbot select` → Manual Pick or Auto-pick; DMs go out; embed updates.\n' +
+          '3) `/warbot select [war]` → Manual Pick or Auto-pick; DMs go out; embed updates.\n' +
           '4) If a starter drops after lock, admins are pinged to re-select; if no backups, recruitment is pinged.\n' +
           '5) 🛑 on the sign-up (admins) cancels & deletes.';
         try {
@@ -464,10 +495,17 @@ client.on('interactionCreate', async (interaction) => {
           'React 👍 to join. Unreact to drop out.',
         ].join('\n');
 
-        const embed = new EmbedBuilder().setTitle('War Sign-up').setColor(0x2ecc71).setDescription(description).setFooter({ text: `Team size: ${sizeNum}v${sizeNum}` });
-        const msg = await warChannel.send({ embeds: [embed] });
+        const warId = nextWarId++;
+        const embed = new EmbedBuilder()
+          .setTitle(`War Sign-up #${warId}`)
+          .setColor(0x2ecc71)
+          .setDescription(description)
+          .setFooter({ text: `Team size: ${sizeNum}v${sizeNum}` });
+        const msg = await warChannel.send({ embeds: [embed] });        const msg = await warChannel.send({ embeds: [embed] });
 
         wars.set(msg.id, {
+          id: nextWarId++,
+          channelId: warChannel.id,
           teamSize: sizeNum,
           pool: new Map(),
           starters: [],
