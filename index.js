@@ -1,1150 +1,740 @@
-// index.js — WarBot (production): manual roster picker + auto-pick + rich DMs + drop-after-lock handling
+// index.js — WarBot PRODUCTION (sticky wizard + War ID always visible + Render-friendly)
+
+// ---------- Crash guards ----------
+process.on('unhandledRejection', (err) => console.error('UNHANDLED REJECTION:', err?.stack || err));
+process.on('uncaughtException', (err) => console.error('UNCAUGHT EXCEPTION:', err?.stack || err));
+process.on('warning', (w) => console.warn('NODE WARNING:', w?.stack || w));
+
 import 'dotenv/config';
+import http from 'http';
 import {
   Client,
   GatewayIntentBits,
   Partials,
   REST,
   Routes,
-  EmbedBuilder,
+  SlashCommandBuilder,
   ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
   StringSelectMenuBuilder,
+  ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  ModalBuilder,
-  PermissionsBitField,
-  Events,
+  ButtonBuilder,
+  ButtonStyle,
+  PermissionFlagsBits,
 } from 'discord.js';
+import { google } from 'googleapis';
 
-import { initDB, getMaxWarId } from './db.js';          // safe no-op if you haven't wired persistence yet
-import { initSheets } from './sheets.js';  // safe no-op if you use a stub; keeps creds checked
+import {
+  initSheets,
+  getNextWarId,
+  pushWarLock,
+  pushAddedMap,
+} from './sheets.js';
+import { initDB, getPlayerStats } from './db.js';
 
-initDB();
-const wars = new Map();
-let nextWarId = 1; 
-
-
-/* ============== IN-MEMORY STATE ============== */
-const wars = new Map(); // messageId -> war
-/*
-war = { 
-  id: number,
-  channelId: string,
-  teamSize: number,
-  pool: Map<userId, { name, joinedISO }>,
-  starters: string[],
-  backups: string[],
-  locked: boolean,
-  meta: { opponent, format, startET },
+// ---------- Tiny HTTP server (only if PORT exists; OK for Render Web Service) ----------
+const portFromEnv = Number(process.env.PORT);
+if (Number.isFinite(portFromEnv) && portFromEnv > 0) {
+  const server = http.createServer((_, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('WarBot OK\n');
+  });
+  server.on('error', (e) => console.error('Health server error:', e));
+  server.listen(portFromEnv, '0.0.0.0', () => console.log(`🌐 Health server listening on :${portFromEnv}`));
+} else {
+  console.log('ℹ️ No PORT provided; skipping HTTP health server (OK for Background Worker).');
 }
-*/
 
-const newWizard = new Map(); // userId -> { teamSize, format, opponent? }
+// ---------- Config ----------
+const AUTO_THREAD = String(process.env.AUTO_THREAD ?? 'true').toLowerCase() === 'true';
+const ARCHIVE_MINUTES = Number(process.env.ARCHIVE_MINUTES || 1440); // 1 day
+const CLEANUP_MS = (Number(process.env.CLEANUP_SECONDS || 10)) * 1000;
 
-/* ============== DISCORD CLIENT ============== */
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildMessageReactions,
-    GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-  partials: [Partials.Channel, Partials.Message, Partials.Reaction],
-});
-
-const isAdminish = (member) => {
+function isAdminish(member) {
   if (!member) return false;
-  const roles = new Set(member.roles.cache.map((r) => r.id));
-  const allowed = [
+  const roleIds = [
     process.env.ROLE_ADMIN,
     process.env.ROLE_MANAGER,
     process.env.ROLE_KEEPER,
     process.env.ROLE_CAPTAIN,
   ].filter(Boolean);
+  if (roleIds.some((id) => member.roles.cache.has(id))) return true;
   return (
-    allowed.some((id) => roles.has(id)) ||
-    member.permissions.has(PermissionsBitField.Flags.Administrator)
+    member.permissions.has(PermissionFlagsBits.ManageGuild) ||
+    member.permissions.has(PermissionFlagsBits.ManageMessages)
   );
-};
-
-/* ============== UTILITIES ============== */
-function sortedPoolArray(war) {
-  return [...war.pool.entries()]
-    .sort((a, b) => new Date(a[1].joinedISO) - new Date(b[1].joinedISO))
-    .map(([userId, p]) => ({ userId, ...p }));
-}
-function listWithTimes(war) {
-  const arr = sortedPoolArray(war);
-  if (!arr.length) return 'No one yet.';
-  return arr
-    .map((p, i) => `${i + 1}. ${p.name} — <t:${Math.floor(new Date(p.joinedISO).getTime() / 1000)}:t>`)
-    .join('\n');
-}
-function etString(iso) {
-  const d = new Date(iso);
-  return d.toLocaleString('en-US', {
-    timeZone: 'America/New_York',
-    weekday: 'short',
-    month: 'short',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: true,
-  });
-}
-async function updateSignupEmbed(msg) {
-  const war = wars.get(msg.id);
-  if (!war) return;
-  const base = msg.embeds?.[0];
-const embed = base ? EmbedBuilder.from(base) : new EmbedBuilder().setColor(0x2ecc71);
-  embed.setTitle(`War Sign-up #${war.id}`);
-
-    const startersText = war.starters?.length
-    ? war.starters.map((id) => war.pool.get(id)?.name ?? `User ${id}`).join(', ')
-    : '—';
-  const backupsText = war.backups?.length
-    ? war.backups.map((id) => war.pool.get(id)?.name ?? `User ${id}`).join(', ')
-    : '—';
-
-  embed.setFields(
-    { name: `Starters (${war.starters?.length || 0}/${war.teamSize})`, value: startersText },
-    { name: `Backups (${war.backups?.length || 0})`, value: backupsText },
-    { name: 'Sign-ups', value: listWithTimes(war) }
-  );
-  embed.setFooter({ text: war.locked ? 'Roster locked' : 'Roster open' });
-
-  await msg.edit({ embeds: [embed] });
-}
-async function findLatestWarMessageInChannel(channel) {
-  const msgs = await channel.messages.fetch({ limit: 50 });
-  return msgs.find((m) => wars.has(m.id));
 }
 
-async function findWarMessageInChannelById(channel, warId) {
-  for (const [msgId, war] of wars.entries()) {
-    if (war.id === warId && war.channelId === channel.id) {
-      return channel.messages.fetch(msgId).catch(() => null);
-    }
+// ---------- Always keep War ID visible ----------
+function embedWithWarId(baseEmbed, warId) {
+  const idTxt = String(warId);
+  const title = baseEmbed.title && !/War Sign-up #/i.test(baseEmbed.title)
+    ? baseEmbed.title
+    : `War Sign-up #${idTxt}`;
+
+  const desc = baseEmbed.description || '';
+  const ensuredDesc = /\*\*War ID:\*\s*.*/i.test(desc)
+    ? desc.replace(/\*\*War ID:\*\s*.*/i, `**War ID:** ${idTxt}`)
+    : `**War ID:** ${idTxt}\n${desc}`;
+
+  return { ...baseEmbed, title, description: ensuredDesc, footer: { text: `War #${idTxt}` } };
+}
+
+// ---------- Time options (next ~50h, 30-min steps, ET) ----------
+function buildTimeChoices() {
+  const out = [];
+  const now = new Date();
+  const t = new Date(now.getTime());
+  const m = t.getMinutes();
+  t.setMinutes(m < 30 ? 30 : 60, 0, 0);
+  for (let i = 0; i < 100; i++) {
+    const d = new Date(t.getTime() + i * 30 * 60 * 1000);
+    const label =
+      d.toLocaleString('en-US', {
+        weekday: 'short', month: 'numeric', day: 'numeric',
+        hour: 'numeric', minute: '2-digit', hour12: true,
+        timeZone: 'America/New_York',
+      }) + ' ET';
+    out.push({ label, value: label });
   }
-  return null;
+  return out;
 }
 
-/* ============== COMMANDS ============== */
+// ---------- SOCOM 2 maps ----------
+const SOCOM2_MAPS = [
+  'Frostfire - Suppression','Blizzard - Demolition','Night Stalker - Demolition','Desert Glory - Extraction',
+  "Rat's Nest - Suppression",'Abandoned - Suppression','The Ruins - Demolition','Blood Lake - Extraction',
+  'Bitter Jungle - Demolition','Death Trap - Extraction','Sandstorm - Breach','Fish Hook - Extraction',
+  'Crossroads - Demolition','Crossroads Night - Demolition','Fox Hunt - Escort','The Mixer - Escort',
+  'Vigilance - Suppression','Requiem - Demolition','Guidance - Escort','Chain Reaction - Suppression',
+  'Sujo - Breach','Enowapi - Breach','Shadow Falls - Suppression',
+];
+
+// ---------- Minimal Sheets reads for /summary ----------
+async function getSheetsClient() {
+  const auth = new google.auth.GoogleAuth({
+    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+  });
+  return google.sheets({ version: 'v4', auth });
+}
+async function getValues(range) {
+  const sheets = await getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.SHEETS_ID,
+    range,
+  });
+  return res.data.values || [];
+}
+async function loadWarBundle(warId) {
+  const id = String(warId);
+  const [wars, players, maps] = await Promise.all([
+    getValues('wars!A2:F'),         // war_id | opponent | format | start_et | locked_at | vod_url
+    getValues('war_players!A2:D'),  // war_id | user_id | name | role
+    getValues('maps!A2:E'),         // war_id | map_order | map_name | our_score | opp_score
+  ]);
+  const w = wars.find((r) => r[0] === id);
+  if (!w) return null;
+  const war = { id, opponent: w[1] || 'TBD', format: (w[2] || '').toUpperCase(), start_et: w[3] || '', locked_at: w[4] || '', vod_url: w[5] || '' };
+  const roster = {
+    starters: players.filter((r) => r[0] === id && r[3] === 'starter').map((r) => ({ user_id: r[1], name: r[2] })),
+    backups:  players.filter((r) => r[0] === id && r[3] === 'backup').map((r) => ({ user_id: r[1], name: r[2] })),
+  };
+  const warMaps = maps.filter((r) => r[0] === id).map((r) => ({
+    order: parseInt(r[1] || '0', 10),
+    name: r[2] || `Map ${r[1]}`,
+    our: Number.isFinite(parseInt(r[3], 10)) ? parseInt(r[3], 10) : null,
+    opp: Number.isFinite(parseInt(r[4], 10)) ? parseInt(r[4], 10) : null,
+  })).sort((a,b)=>a.order-b.order);
+  let ourWins=0, oppWins=0;
+  for (const m of warMaps) { if (m.our==null||m.opp==null) continue; if (m.our>m.opp) ourWins++; else if (m.opp>m.our) oppWins++; }
+  return { war, roster, maps: warMaps, tally: { ourWins, oppWins } };
+}
+function buildResultEmbed(bundle) {
+  const { war, roster, maps, tally } = bundle;
+  const mapLines = maps.length ? maps.map(m => `**${m.order}. ${m.name}** — ${m.our==null||m.opp==null ? '—' : `${m.our}–${m.opp}`}`).join('\n') : '_No maps recorded_';
+  const startersStr = roster.starters.length ? roster.starters.map(p => p.name).join(', ') : '_none_';
+  const backupsStr  = roster.backups.length  ? roster.backups.map(p => p.name).join(', ')  : '_none_';
+  const title = (tally.ourWins + tally.oppWins) > 0 ? `Match Result vs ${war.opponent} — ${tally.ourWins}-${tally.oppWins}` : `Match vs ${war.opponent} — Pending Scores`;
+  return {
+    title,
+    description: `**War ID:** ${war.id}\n**Format:** ${war.format || 'TBD'}\n**Start:** ${war.start_et || 'TBD'}${war.vod_url ? `\n**VOD:** ${war.vod_url}` : ''}`,
+    fields: [
+      { name: 'Starters', value: startersStr, inline: false },
+      { name: 'Backups', value: backupsStr, inline: false },
+      { name: 'Maps', value: mapLines, inline: false },
+    ],
+    footer: { text: `War #${war.id}` },
+  };
+}
+
+// ---------- In-memory state ----------
+const wizardState = new Map();      // userId -> { warId, teamSize, format, opponent, startET }
+const pools = new Map();            // messageId -> { warId, signups: Map<userId, {name, tsMs}> }
+const warToMessage = new Map();     // warId -> signup messageId
+const warToThread = new Map();      // warId -> threadId
+const pendingLocks = new Map();     // adminId -> { warId, starters, backups, format, stepMsgId, map1..mapN }
+const pendingManual = new Map();    // adminId -> { warId }
+
+// ---------- Sticky component builders ----------
+function teamSizeMenu(selected) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('wb:w:teamsize')
+      .setPlaceholder('Select Team Size (6 / 7 / 8)')
+      .addOptions(
+        { label: '6v6', value: '6', default: selected === '6' },
+        { label: '7v7', value: '7', default: selected === '7' },
+        { label: '8v8', value: '8', default: selected === '8' },
+      )
+  );
+}
+function formatMenu(selected) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('wb:w:format')
+      .setPlaceholder('Select Match Format (BO3 / BO5)')
+      .addOptions(
+        { label: 'Best of 3', value: 'BO3', default: selected === 'BO3' },
+        { label: 'Best of 5', value: 'BO5', default: selected === 'BO5' },
+      )
+  );
+}
+function timeMenu(selected) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('wb:w:time')
+      .setPlaceholder('Pick a start time (ET)')
+      .addOptions(...buildTimeChoices().map(c => ({ label: c.label, value: c.value, default: selected === c.value })))
+  );
+}
+function nextButtons(enabled) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('wb:w:next').setLabel('Next').setStyle(ButtonStyle.Primary).setDisabled(!enabled),
+    new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
+}
+function buildMapSelect(customId, selected) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(customId)
+    .setPlaceholder('Pick a map')
+    .addOptions(...SOCOM2_MAPS.map(m => ({ label: m, value: m, default: selected === m })));
+  return new ActionRowBuilder().addComponents(menu);
+}
+function buildMapDraftComponents(format = 'BO3', current = {}) {
+  const n = format === 'BO5' ? 5 : 3;
+  const rows = [];
+  for (let i = 1; i <= n; i++) rows.push(buildMapSelect(`wb:d:${i}`, current[`map${i}`]));
+  rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('wb:d:finalize').setLabel('Finalize Roster & Maps').setStyle(ButtonStyle.Success)));
+  return rows;
+}
+
+// ---------- Register commands ----------
 async function registerCommands() {
   const commands = [
-    {
-      name: 'warbot',
-      description: 'WarBot commands',
-      options: [
-        { type: 1, name: 'new', description: 'Create a new War Sign-up (dropdowns)' },
-        {
-          type: 1,
-          name: 'select',
-          description: 'Pick roster (manual or auto-pick)',
-          options: [{ type: 4, name: 'war', description: 'War ID', required: false }],
-        },
-        { type: 1, name: 'help', description: 'Show WarBot help and quick reference' },
-        {
-          type: 1,
-          name: 'simulate',
-          description: 'Admin: seed 10 fake signups (testing only)',
-          options: [{ type: 4, name: 'war', description: 'War ID', required: false }],
-        },
-      ],
-    },
-  ];
+    new SlashCommandBuilder()
+      .setName('warbot')
+      .setDescription('WarBot commands')
+      .addSubcommand(s => s.setName('new').setDescription('Create a War Sign-up (wizard)'))
+      .addSubcommand(s =>
+        s.setName('select').setDescription('Admin: lock roster for a specific war')
+         .addIntegerOption(o => o.setName('war_id').setDescription('War ID to manage').setRequired(true))
+         .addStringOption(o => o.setName('mode').setDescription('How to select starters').addChoices(
+           { name: 'Auto: first N to sign up', value: 'auto' },
+           { name: 'Manual: I will pick', value: 'manual' }
+         ).setRequired(true))
+         .addIntegerOption(o => o.setName('team_size').setDescription('N for auto (6,7,8). Defaults to creation choice.').setMinValue(6).setMaxValue(8))
+      )
+      .addSubcommand(s =>
+        s.setName('summary').setDescription('Post a public summary to results channel (reads from Sheets)')
+         .addIntegerOption(o => o.setName('war_id').setDescription('War ID').setRequired(true))
+         .addBooleanOption(o => o.setName('preview_only').setDescription('Reply privately instead of posting'))
+      )
+      .addSubcommand(s =>
+        s.setName('stats').setDescription('View player stats')
+         .addUserOption(o => o.setName('player').setDescription('Player to view').setRequired(true))
+      ),
+  ].map(c => c.toJSON());
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  await rest.put(
-    Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-    { body: commands }
-  );
+  await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: commands });
   console.log('✅ Registered /warbot commands');
 }
 
-/* ============== READY ============== */
-client.once(Events.ClientReady, async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-  await initSheets();
-  await registerCommands();
+// ---------- Client ----------
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages,
+  ],
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
+client.on('error', (e) => console.error('DISCORD CLIENT ERROR:', e?.stack || e));
+client.on('shardError', (e) => console.error('DISCORD SHARD ERROR:', e?.stack || e));
 
-/* ============== INTERACTIONS ============== */
+// ---------- Interactions ----------
 client.on('interactionCreate', async (interaction) => {
   try {
-    /* ---------- SLASH ---------- */
-    if (interaction.isChatInputCommand()) {
-      if (interaction.commandName !== 'warbot') return;
+    // Slash commands
+    if (interaction.isChatInputCommand() && interaction.commandName === 'warbot') {
       const sub = interaction.options.getSubcommand();
 
-      // HELP
-      if (sub === 'help') {
-        const embed = new EmbedBuilder()
-          .setTitle('WarBot — Quick Reference')
-          .setColor(0x5865f2)
-          .setDescription(
-            [
-              '**Users**',
-              '• React 👍 to sign up; unreact to drop out.\n• You will be DM’d if selected as **starter** or **backup**.',
-              '',
-              '**Admins / Managers / Captains**',
-              '• `/warbot new` → dropdowns for team size & format → opponent → time.',
-              '• `/warbot select [war]` → **Manual Pick** or **Auto-pick First N**; DMs go out; embed updates.',
-              '• If a starter drops after lock, roster unlocks and admins are pinged to re-select.',
-              '',
-              '**Cancel**',
-              '• React 🛑 on the sign-up (admins only) to cancel & delete the post.',
-            ].join('\n')
-          );
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('help:full').setLabel('Show full tutorial (DM)').setStyle(ButtonStyle.Primary)
-        );
-        return interaction.reply({ ephemeral: true, embeds: [embed], components: [row] });
+      if (sub === 'new') {
+        // War ID (with UTC timestamp fallback)
+        let warId = await getNextWarId().catch(() => null);
+        if (!warId && warId !== 0) {
+          const now = new Date();
+          warId = Number(`${now.getUTCFullYear()}${String(now.getUTCMonth()+1).padStart(2,'0')}${String(now.getUTCDate()).padStart(2,'0')}${String(now.getUTCHours()).padStart(2,'0')}${String(now.getUTCMinutes()).padStart(2,'0')}`);
+        }
+        // Wizard state
+        wizardState.set(interaction.user.id, { warId, teamSize: null, format: null, opponent: null, startET: null });
+
+        await interaction.reply({
+          content:
+            `🧭 **War Wizard** — **War ID ${warId}**\n` +
+            `1) Choose **Team Size**\n2) Choose **Format**\n3) Enter **Opponent** & **Start Time**\n\n` +
+            `Your selections will remain visible below.`,
+          components: [teamSizeMenu(null), formatMenu(null), nextButtons(false)],
+          ephemeral: true,
+        });
+        return;
       }
 
-      // SIMULATE
-      if (sub === 'simulate') {
-        if (!isAdminish(interaction.member)) {
-          return interaction.reply({ ephemeral: true, content: 'No permission.' });
+      if (sub === 'select') {
+        const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        if (!isAdminish(member)) {
+          await interaction.reply({ content: '⛔ You do not have permission to manage rosters.', ephemeral: true });
+          return;
         }
-        const idOpt = interaction.options.getInteger('war');
-        const warMsg = idOpt
-          ? await findWarMessageInChannelById(interaction.channel, idOpt)
-          : await findLatestWarMessageInChannel(interaction.channel);
-        if (!warMsg) {
-          return interaction.reply({ ephemeral: true, content: 'No active War Sign-up here. Run /warbot new first.' });
+        const warId = interaction.options.getInteger('war_id', true);
+        const mode = interaction.options.getString('mode', true);
+        const teamSizeOpt = interaction.options.getInteger('team_size') || null;
+
+        const messageId = warToMessage.get(String(warId));
+        const pool = messageId ? pools.get(messageId) : null;
+
+        if (mode === 'auto') {
+          const N = teamSizeOpt || 8;
+          if (!pool || pool.signups.size === 0) {
+            await interaction.reply({ content: `❌ No live pool found or no signups for War ID ${warId}. Try manual mode.`, ephemeral: true });
+            return;
+          }
+          const entries = [...pool.signups.entries()].sort((a, b) => a[1].tsMs - b[1].tsMs);
+          const starters = entries.slice(0, N).map(([userId, v]) => ({ userId, name: v.name }));
+          const backups = entries.slice(N).map(([userId, v]) => ({ userId, name: v.name }));
+
+          const msg = await interaction.reply({
+            content: `🔐 Auto-selecting **${N}** starters for **War ID ${warId}**.\nPick the maps (last must be Crossroads / Crossroads Night).`,
+            components: buildMapDraftComponents('BO3'),
+            ephemeral: true,
+            fetchReply: true,
+          });
+          pendingLocks.set(interaction.user.id, { warId, starters, backups, format: 'BO3', stepMsgId: msg.id });
+          return;
+        } else {
+          const modal = new ModalBuilder().setCustomId('wb:m:manual').setTitle(`Manual Roster — War ${warId}`);
+          const starters = new TextInputBuilder().setCustomId('wb:m:starters').setLabel('Starters (comma-separated @mentions or names)').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(400);
+          const backups  = new TextInputBuilder().setCustomId('wb:m:backups').setLabel('Backups (optional, comma-separated)').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(400);
+          modal.addComponents(new ActionRowBuilder().addComponents(starters), new ActionRowBuilder().addComponents(backups));
+          pendingManual.set(interaction.user.id, { warId });
+          await interaction.showModal(modal);
+          return;
         }
-        const war = wars.get(warMsg.id);
-        const already = war.pool.size;
-        for (let i = 1; i <= 10; i++) {
-          const fakeId = `9990000000000${String(i).padStart(2, '0')}`;
-          if (!war.pool.has(fakeId)) {
-            war.pool.set(fakeId, { name: `FakeUser${i}`, joinedISO: new Date(Date.now() + i * 500).toISOString() });
+      }
+
+      if (sub === 'summary') {
+        const warId = interaction.options.getInteger('war_id', true);
+        const previewOnly = interaction.options.getBoolean('preview_only') || false;
+
+        await interaction.deferReply({ ephemeral: true });
+        const bundle = await loadWarBundle(warId);
+        if (!bundle) {
+          await interaction.editReply({ content: `❌ Could not find war_id=${warId} in the Sheet.` });
+          return;
+        }
+        const embed = buildResultEmbed(bundle);
+        if (previewOnly) {
+          await interaction.editReply({ embeds: [embed], content: '🔍 Preview only (not posted publicly).' });
+        } else {
+          const chId = process.env.RESULTS_CHANNEL_ID;
+          const ch = chId ? await client.channels.fetch(chId).catch(() => null) : null;
+          if (!ch || !ch.isTextBased()) {
+            await interaction.editReply({ content: '❌ RESULTS_CHANNEL_ID is missing or invalid.' });
+            return;
+          }
+          await ch.send({ embeds: [embed] });
+          await interaction.editReply({ content: `✅ Posted to <#${chId}>`, embeds: [embed] });
+        }
+        return;
+      }
+
+      if (sub === 'stats') {
+        const user = interaction.options.getUser('player', true);
+        const stats = await getPlayerStats(user.id);
+        await interaction.reply({
+          embeds: [{
+            title: `📊 Stats for ${user.username}`,
+            fields: [{ name: 'Totals', value: `Wars: ${stats.totals.wars}\nWins: ${stats.totals.wins}\nLosses: ${stats.totals.losses}\nMap Wins: ${stats.totals.mapWins}\nMap Losses: ${stats.totals.mapLosses}\nNo-shows: ${stats.totals.noshows}` }],
+          }],
+          ephemeral: true,
+        });
+        return;
+      }
+    }
+
+    // Wizard dropdowns
+    if (interaction.isStringSelectMenu()) {
+      const uid = interaction.user.id;
+      const st = wizardState.get(uid);
+      if (!st) return;
+
+      if (interaction.customId === 'wb:w:teamsize') {
+        st.teamSize = interaction.values[0];
+        await interaction.update({
+          content: `🧭 **War Wizard** — **War ID ${st.warId}**\nTeam Size: **${st.teamSize || '—'}** | Format: **${st.format || '—'}**\nSelect both, then click **Next**.`,
+          components: [teamSizeMenu(st.teamSize), formatMenu(st.format), nextButtons(!!(st.teamSize && st.format))],
+        });
+        return;
+      }
+      if (interaction.customId === 'wb:w:format') {
+        st.format = interaction.values[0];
+        await interaction.update({
+          content: `🧭 **War Wizard** — **War ID ${st.warId}**\nTeam Size: **${st.teamSize || '—'}** | Format: **${st.format || '—'}**\nSelect both, then click **Next**.`,
+          components: [teamSizeMenu(st.teamSize), formatMenu(st.format), nextButtons(!!(st.teamSize && st.format))],
+        });
+        return;
+      }
+      if (interaction.customId === 'wb:w:time') {
+        st.startET = interaction.values[0];
+        await interaction.update({
+          content: `🧭 **War Wizard** — **War ID ${st.warId}**\nOpponent: **${st.opponent || '—'}**\nStart (ET): **${st.startET || '—'}**\nClick **Create Sign-up** to post.`,
+          components: [
+            timeMenu(st.startET),
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success),
+              new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+            ),
+          ],
+        });
+        return;
+      }
+    }
+
+    // Wizard buttons / modal
+    if (interaction.isButton()) {
+      const uid = interaction.user.id;
+      const st = wizardState.get(uid);
+
+      if (interaction.customId === 'wb:w:cancel') {
+        wizardState.delete(uid);
+        await interaction.update({ content: '❌ Wizard cancelled.', components: [] });
+        return;
+      }
+
+      if (interaction.customId === 'wb:w:next') {
+        if (!st || !st.teamSize || !st.format) {
+          await interaction.reply({ content: 'Please choose team size and format first.', ephemeral: true });
+          return;
+        }
+        const modal = new ModalBuilder().setCustomId('wb:w:oppmodal').setTitle('Enter Opponent');
+        const opp = new TextInputBuilder().setCustomId('wb:w:opptxt').setLabel('Opponent name').setStyle(TextInputStyle.Short).setMaxLength(50).setRequired(true);
+        modal.addComponents(new ActionRowBuilder().addComponents(opp));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (interaction.customId === 'wb:w:create') {
+        if (!st || !st.opponent || !st.startET) {
+          await interaction.reply({ content: 'Please enter opponent and pick a start time first.', ephemeral: true });
+          return;
+        }
+        const channelId = process.env.WAR_CHANNEL_ID;
+        const channel = channelId ? await client.channels.fetch(channelId).catch(()=>null) : null;
+        if (!channel || !channel.isTextBased()) {
+          await interaction.reply({ content: '❌ WAR_CHANNEL_ID is missing or invalid.', ephemeral: true });
+          return;
+        }
+
+        // Optional ping when pool opens (auto-delete)
+        if (process.env.PING_POOL_ROLE_ID) {
+          const pingMsg = await channel.send({ content: `<@&${process.env.PING_POOL_ROLE_ID}>` }).catch(()=>null);
+          if (pingMsg && CLEANUP_MS > 0) setTimeout(() => pingMsg.delete().catch(()=>{}), CLEANUP_MS);
+        }
+
+        let embed = {
+          title: `War Sign-up #${st.warId}`,
+          description:
+            `**War ID:** ${st.warId}\n` +
+            `**Opponent:** ${st.opponent}\n` +
+            `**Format:** ${st.format}\n` +
+            `**Team Size:** ${st.teamSize}v${st.teamSize}\n` +
+            `**Start (ET):** ${st.startET}\n\n` +
+            `React with 👍 to **join** (timestamp recorded).\nReact with 🛑 to **cancel this sign-up**.\n\n` +
+            `Admins: use \`/warbot select war_id:${st.warId}\` to lock this war.`,
+        };
+        embed = embedWithWarId(embed, st.warId);
+
+        const msg = await channel.send({ embeds: [embed] });
+        warToMessage.set(String(st.warId), msg.id);
+        pools.set(msg.id, { warId: st.warId, signups: new Map() });
+
+        // Keep channel clean: thread per war
+        if (AUTO_THREAD && msg.hasThread === false && msg.startThread) {
+          try {
+            const thread = await msg.startThread({ name: `war-${st.warId}-chat`, autoArchiveDuration: ARCHIVE_MINUTES });
+            warToThread.set(String(st.warId), thread.id);
+            await thread.send(`Thread created for **War #${st.warId}**. Discussion here to keep <#${channel.id}> clean.`);
+          } catch (e) {
+            console.warn('Could not start thread:', e?.message || e);
           }
         }
-        await updateSignupEmbed(warMsg);
-        if (war.pool.size >= war.teamSize && !war.locked && process.env.ADMIN_PING_ROLE_ID) {
-          await interaction.channel.send({ content: `<@&${process.env.ADMIN_PING_ROLE_ID}> ${war.teamSize}+ signed up (simulation).` });
-        }
-        return interaction.reply({ ephemeral: true, content: `✅ Seeded ${war.pool.size - already} fake signups (now ${war.pool.size} in pool).` });
-      }
 
-      // NEW (dropdown wizard)
-      if (sub === 'new') {
-        if (!isAdminish(interaction.member)) {
-          return interaction.reply({ ephemeral: true, content: 'You do not have permission to create wars.' });
-        }
-        newWizard.set(interaction.user.id, { teamSize: null, format: null, opponent: null });
+        await msg.react('👍').catch(()=>{});
+        await msg.react('🛑').catch(()=>{});
 
-        const sizeSelect = new StringSelectMenuBuilder()
-          .setCustomId('new:size')
-          .setPlaceholder('Select team size')
-          .addOptions({ label: '6v6', value: '6' }, { label: '7v7', value: '7' }, { label: '8v8', value: '8' });
-
-        const formatSelect = new StringSelectMenuBuilder()
-          .setCustomId('new:format')
-          .setPlaceholder('Select format')
-          .addOptions({ label: 'Best of 3', value: 'bo3' }, { label: 'Best of 5', value: 'bo5' });
-
-        const nextBtn = new ButtonBuilder()
-          .setCustomId('new:next')
-          .setLabel('Next: Opponent & Time')
-          .setStyle(ButtonStyle.Primary)
-          .setDisabled(true);
-
-        return interaction.reply({
-          ephemeral: true,
-          content: 'Set up your War Sign-up:',
-          components: [
-            new ActionRowBuilder().addComponents(sizeSelect),
-            new ActionRowBuilder().addComponents(formatSelect),
-            new ActionRowBuilder().addComponents(nextBtn),
-          ],
+        await interaction.update({
+          content:
+            `✅ **War Sign-up #${st.warId}** created in <#${channel.id}>.\n` +
+            `Opponent: **${st.opponent}** | Format: **${st.format}** | Team: **${st.teamSize}v${st.teamSize}** | Start: **${st.startET}**`,
+          components: [],
         });
-      }
-
-      // SELECT (present options)
-      if (sub === 'select') {
-        if (!isAdminish(interaction.member)) {
-          return interaction.reply({ ephemeral: true, content: 'No permission.' });
-        }
-        const idOpt = interaction.options.getInteger('war');
-        const warMsg = idOpt
-          ? await findWarMessageInChannelById(interaction.channel, idOpt)
-          : await findLatestWarMessageInChannel(interaction.channel);
-        if (!warMsg) {
-          return interaction.reply({ ephemeral: true, content: 'No War Sign-up found in this channel.' });
-        }
-        const war = wars.get(warMsg.id);
-        const poolArr = sortedPoolArray(war);
-        if (poolArr.length < war.teamSize) {
-          return interaction.reply({ ephemeral: true, content: `Need at least ${war.teamSize} sign-ups (currently ${poolArr.length}).` });
-        }
-
-        // Controls: manual or auto
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`select:auto:${warMsg.id}`)
-            .setLabel(`Auto-pick First ${war.teamSize}`)
-            .setStyle(ButtonStyle.Success),
-          new ButtonBuilder().setCustomId(`select:manual:${warMsg.id}`).setLabel('Manual Pick').setStyle(ButtonStyle.Primary)
-        );
-        return interaction.reply({ ephemeral: true, content: 'Choose how to select the roster:', components: [row] });
+        wizardState.delete(uid);
+        return;
       }
     }
 
-    /* ---------- BUTTONS ---------- */
-    if (interaction.isButton()) {
-      // Help → DM
-      if (interaction.customId === 'help:full') {
-        const longText =
-          '📖 **WarBot Full Tutorial**\n\n' +
-          '1) `/warbot new` → choose team size & format, enter opponent, pick time.\n' +
-          '2) Players react 👍 to join; unreact to drop.\n' +
-          '3) `/warbot select [war]` → Manual Pick or Auto-pick; DMs go out; embed updates.\n' +
-          '4) If a starter drops after lock, admins are pinged to re-select; if no backups, recruitment is pinged.\n' +
-          '5) 🛑 on the sign-up (admins) cancels & deletes.';
-        try {
-          await interaction.user.send(longText);
-          return interaction.reply({ ephemeral: true, content: '📬 Sent you the full tutorial in DMs.' });
-        } catch {
-          return interaction.reply({ ephemeral: true, content: '❌ Could not DM you (DMs closed).' });
-        }
-      }
-
-      // NEW → Next → Opponent modal
-      if (interaction.customId === 'new:next') {
-        const wiz = newWizard.get(interaction.user.id);
-        if (!wiz || !wiz.teamSize || !wiz.format) {
-          return interaction.reply({ ephemeral: true, content: 'Please select both Team Size and Format first.' });
-        }
-        const modal = new ModalBuilder().setCustomId('new:oppmodal').setTitle('Opponent Name');
-        const oppInput = new TextInputBuilder().setCustomId('new:opp').setLabel('Opponent').setStyle(TextInputStyle.Short).setRequired(true);
-        modal.addComponents(new ActionRowBuilder().addComponents(oppInput));
-        return interaction.showModal(modal);
-      }
-
-      // SELECT → Auto-pick
-      if (interaction.customId.startsWith('select:auto:')) {
-        if (!isAdminish(interaction.member)) {
-          return interaction.reply({ ephemeral: true, content: 'No permission.' });
-        }
-        const warMsgId = interaction.customId.split(':')[2];
-        const channel = interaction.channel;
-        const warMsg = await channel.messages.fetch(warMsgId).catch(() => null);
-        if (!warMsg || !wars.has(warMsg.id)) {
-          return interaction.reply({ ephemeral: true, content: 'War Sign-up not found.' });
-        }
-        const war = wars.get(warMsg.id);
-        const poolArr = sortedPoolArray(war);
-        war.starters = poolArr.slice(0, war.teamSize).map((p) => p.userId);
-        war.backups = poolArr.slice(war.teamSize).map((p) => p.userId);
-        war.locked = true;
-
-        // DM real members
-        for (const uid of war.starters) {
-          interaction.guild.members.fetch(uid).then((m) => m.send(starterDM(war))).catch(() => {});
-        }
-        for (const uid of war.backups) {
-          interaction.guild.members.fetch(uid).then((m) => m.send(backupDM(war))).catch(() => {});
-        }
-
-        await updateSignupEmbed(warMsg);
-        return interaction.update({ content: `✅ Auto-picked ${war.teamSize} starters (${war.backups.length} backups). Roster locked.`, components: [] });
-      }
-
-      // SELECT → Manual Pick (show selector)
-      if (interaction.customId.startsWith('select:manual:')) {
-        if (!isAdminish(interaction.member)) {
-          return interaction.reply({ ephemeral: true, content: 'No permission.' });
-        }
-        const warMsgId = interaction.customId.split(':')[2];
-        const channel = interaction.channel;
-        const warMsg = await channel.messages.fetch(warMsgId).catch(() => null);
-        if (!warMsg || !wars.has(warMsg.id)) {
-          return interaction.reply({ ephemeral: true, content: 'War Sign-up not found.' });
-        }
-        const war = wars.get(warMsg.id);
-        const poolArr = sortedPoolArray(war);
-
-        // Build options (≤ 25 supported; you said ≤ 20 total)
-        const options = poolArr.slice(0, 25).map((p) => ({
-          label: p.name,
-          value: `${p.userId}`,
-          description: `Joined ${new Date(p.joinedISO).toLocaleTimeString()}`,
-        }));
-
-        const select = new StringSelectMenuBuilder()
-          .setCustomId(`select:pick:${warMsg.id}:${war.teamSize}`)
-          .setPlaceholder(`Pick exactly ${war.teamSize} starters`)
-          .setMinValues(war.teamSize)
-          .setMaxValues(war.teamSize)
-          .addOptions(options);
-
-        const confirm = new ButtonBuilder()
-          .setCustomId(`select:confirm:${warMsg.id}`)
-          .setLabel('Confirm Roster')
-          .setStyle(ButtonStyle.Success)
-          .setDisabled(true); // enabled after selection arrives
-
-        return interaction.update({
-          content: `Select **${war.teamSize}** starters from the pool:`,
-          components: [new ActionRowBuilder().addComponents(select), new ActionRowBuilder().addComponents(confirm)],
-        });
-      }
-
-      // SELECT → Confirm Roster
-      if (interaction.customId.startsWith('select:confirm:')) {
-        if (!isAdminish(interaction.member)) {
-          return interaction.reply({ ephemeral: true, content: 'No permission.' });
-        }
-        const warMsgId = interaction.customId.split(':')[2];
-        const channel = interaction.channel;
-        const warMsg = await channel.messages.fetch(warMsgId).catch(() => null);
-        if (!warMsg || !wars.has(warMsg.id)) {
-          return interaction.reply({ ephemeral: true, content: 'War Sign-up not found.' });
-        }
-        const war = wars.get(warMsg.id);
-        if (!war._pendingStarters || war._pendingStarters.length !== war.teamSize) {
-          return interaction.reply({ ephemeral: true, content: `Please pick exactly ${war.teamSize} starters first.` });
-        }
-
-        war.starters = [...war._pendingStarters];
-        const poolArr = sortedPoolArray(war);
-        const starterSet = new Set(war.starters);
-        war.backups = poolArr.filter((p) => !starterSet.has(p.userId)).map((p) => p.userId);
-        war.locked = true;
-        delete war._pendingStarters;
-
-        // DM real members
-        for (const uid of war.starters) {
-          interaction.guild.members.fetch(uid).then((m) => m.send(starterDM(war))).catch(() => {});
-        }
-        for (const uid of war.backups) {
-          interaction.guild.members.fetch(uid).then((m) => m.send(backupDM(war))).catch(() => {});
-        }
-
-        await updateSignupEmbed(warMsg);
-        return interaction.update({ content: `✅ Roster locked. Starters: ${war.starters.length}. Backups: ${war.backups.length}.`, components: [] });
-      }
-    }
-
-    /* ---------- SELECT MENUS ---------- */
-    if (interaction.isStringSelectMenu()) {
-      // NEW → team size
-      if (interaction.customId === 'new:size') {
-        const wiz = newWizard.get(interaction.user.id) || {};
-        wiz.teamSize = Number(interaction.values[0]);
-        newWizard.set(interaction.user.id, wiz);
-        const enableNext = Boolean(wiz.teamSize && wiz.format);
-        const nextBtn = new ButtonBuilder().setCustomId('new:next').setLabel('Next: Opponent & Time').setStyle(ButtonStyle.Primary).setDisabled(!enableNext);
-        const sizeSelect = new StringSelectMenuBuilder().setCustomId('new:size').setPlaceholder('Select team size').addOptions(
-          { label: '6v6', value: '6' }, { label: '7v7', value: '7' }, { label: '8v8', value: '8' }
-        );
-        const formatSelect = new StringSelectMenuBuilder().setCustomId('new:format').setPlaceholder('Select format').addOptions(
-          { label: 'Best of 3', value: 'bo3' }, { label: 'Best of 5', value: 'bo5' }
-        );
-        return interaction.update({
-          components: [
-            new ActionRowBuilder().addComponents(sizeSelect),
-            new ActionRowBuilder().addComponents(formatSelect),
-            new ActionRowBuilder().addComponents(nextBtn),
-          ],
-        });
-      }
-      // NEW → format
-      if (interaction.customId === 'new:format') {
-        const wiz = newWizard.get(interaction.user.id) || {};
-        wiz.format = interaction.values[0];
-        newWizard.set(interaction.user.id, wiz);
-        const enableNext = Boolean(wiz.teamSize && wiz.format);
-        const nextBtn = new ButtonBuilder().setCustomId('new:next').setLabel('Next: Opponent & Time').setStyle(ButtonStyle.Primary).setDisabled(!enableNext);
-        const sizeSelect = new StringSelectMenuBuilder().setCustomId('new:size').setPlaceholder('Select team size').addOptions(
-          { label: '6v6', value: '6' }, { label: '7v7', value: '7' }, { label: '8v8', value: '8' }
-        );
-        const formatSelect = new StringSelectMenuBuilder().setCustomId('new:format').setPlaceholder('Select format').addOptions(
-          { label: 'Best of 3', value: 'bo3' }, { label: 'Best of 5', value: 'bo5' }
-        );
-        return interaction.update({
-          components: [
-            new ActionRowBuilder().addComponents(sizeSelect),
-            new ActionRowBuilder().addComponents(formatSelect),
-            new ActionRowBuilder().addComponents(nextBtn),
-          ],
-        });
-      }
-
-      // NEW → time (after modal)
-      if (interaction.customId.startsWith('new:time:')) {
-        const [, , sizeStr, fmt, oppEnc] = interaction.customId.split(':');
-        const sizeNum = Number(sizeStr);
-        const opp = decodeURIComponent(oppEnc);
-        const iso = interaction.values[0];
-
-        const warChannelId = process.env.WAR_CHANNEL_ID || interaction.channelId;
-        const warChannel = interaction.guild.channels.cache.get(warChannelId) || interaction.channel;
-
-        const startET = etString(iso);
-        const description = [
-          `**Opponent:** ${opp}`,
-          `**Format:** ${fmt.toUpperCase()}`,
-          `**Start (ET):** ${startET}`,
-          '',
-          'React 👍 to join. Unreact to drop out.',
-        ].join('\n');
-
-        const warId = nextWarId++;
-        const embed = new EmbedBuilder()
-          .setTitle(`War Sign-up #${warId}`)
-          .setColor(0x2ecc71)
-          .setDescription(description)
-          .setFooter({ text: `Team size: ${sizeNum}v${sizeNum}` });
-        const msg = await warChannel.send({ embeds: [embed] });        const msg = await warChannel.send({ embeds: [embed] });
-
-        wars.set(msg.id, {
-          id: nextWarId++,diff --git a/index.js b/index.js
-index 0060ed45fa9b4dc492c437111c32f1c97f499752..cc2392c047ebbae43a7fa9c8f621af9b2a89fb31 100644
---- a/index.js
-+++ b/index.js
-@@ -1,52 +1,55 @@
- // index.js — WarBot (production): manual roster picker + auto-pick + rich DMs + drop-after-lock handling
- import 'dotenv/config';
- import {
-   Client,
-   GatewayIntentBits,
-   Partials,
-   REST,
-   Routes,
-   EmbedBuilder,
-   ActionRowBuilder,
-   ButtonBuilder,
-   ButtonStyle,
-   StringSelectMenuBuilder,
-   TextInputBuilder,
-   TextInputStyle,
-   ModalBuilder,
-   PermissionsBitField,
-   Events,
- } from 'discord.js';
- 
- import { initDB } from './db.js';          // safe no-op if you haven't wired persistence yet
- import { initSheets } from './sheets.js';  // safe no-op if you use a stub; keeps creds checked
- 
- /* ============== IN-MEMORY STATE ============== */
- const wars = new Map(); // messageId -> war
- /*
- war = {
-+  id: number,
-+  channelId: string,
-   teamSize: number,
-   pool: Map<userId, { name, joinedISO }>,
-   starters: string[],
-   backups: string[],
-   locked: boolean,
-   meta: { opponent, format, startET },
- }
- */
- 
- const newWizard = new Map(); // userId -> { teamSize, format, opponent? }
- 
- /* ============== DISCORD CLIENT ============== */
- const client = new Client({
-   intents: [
-     GatewayIntentBits.Guilds,
-     GatewayIntentBits.GuildMembers,
-     GatewayIntentBits.GuildMessages,
-     GatewayIntentBits.GuildMessageReactions,
-     GatewayIntentBits.DirectMessages,
-     GatewayIntentBits.MessageContent,
-   ],
-   partials: [Partials.Channel, Partials.Message, Partials.Reaction],
- });
- 
- const isAdminish = (member) => {
-diff --git a/index.js b/index.js
-index 0060ed45fa9b4dc492c437111c32f1c97f499752..cc2392c047ebbae43a7fa9c8f621af9b2a89fb31 100644
---- a/index.js
-+++ b/index.js
-@@ -71,142 +74,165 @@ function sortedPoolArray(war) {
-     .map(([userId, p]) => ({ userId, ...p }));
- }
- function listWithTimes(war) {
-   const arr = sortedPoolArray(war);
-   if (!arr.length) return 'No one yet.';
-   return arr
-     .map((p, i) => `${i + 1}. ${p.name} — <t:${Math.floor(new Date(p.joinedISO).getTime() / 1000)}:t>`)
-     .join('\n');
- }
- function etString(iso) {
-   const d = new Date(iso);
-   return d.toLocaleString('en-US', {
-     timeZone: 'America/New_York',
-     weekday: 'short',
-     month: 'short',
-     day: '2-digit',
-     hour: '2-digit',
-     minute: '2-digit',
-     hour12: true,
-   });
- }
- async function updateSignupEmbed(msg) {
-   const war = wars.get(msg.id);
-   if (!war) return;
-   const base = msg.embeds?.[0];
--  const embed = base ? EmbedBuilder.from(base) : new EmbedBuilder().setTitle('War Sign-up').setColor(0x2ecc71);
-+  const embed = base ? EmbedBuilder.from(base) : new EmbedBuilder().setColor(0x2ecc71);
-+  embed.setTitle(`War Sign-up #${war.id}`);
- 
-   const startersText = war.starters?.length
-     ? war.starters.map((id) => war.pool.get(id)?.name ?? `User ${id}`).join(', ')
-     : '—';
-   const backupsText = war.backups?.length
-     ? war.backups.map((id) => war.pool.get(id)?.name ?? `User ${id}`).join(', ')
-     : '—';
- 
-   embed.setFields(
-     { name: `Starters (${war.starters?.length || 0}/${war.teamSize})`, value: startersText },
-     { name: `Backups (${war.backups?.length || 0})`, value: backupsText },
-     { name: 'Sign-ups', value: listWithTimes(war) }
-   );
-   embed.setFooter({ text: war.locked ? 'Roster locked' : 'Roster open' });
- 
-   await msg.edit({ embeds: [embed] });
- }
- async function findLatestWarMessageInChannel(channel) {
-   const msgs = await channel.messages.fetch({ limit: 50 });
-   return msgs.find((m) => wars.has(m.id));
- }
- 
-+async function findWarMessageInChannelById(channel, warId) {
-+  for (const [msgId, war] of wars.entries()) {
-+    if (war.id === warId && war.channelId === channel.id) {
-+      return channel.messages.fetch(msgId).catch(() => null);
-+    }
-+  }
-+  return null;
-+}
-+
- /* ============== COMMANDS ============== */
- async function registerCommands() {
-   const commands = [
-     {
-       name: 'warbot',
-       description: 'WarBot commands',
-       options: [
-         { type: 1, name: 'new', description: 'Create a new War Sign-up (dropdowns)' },
--        { type: 1, name: 'select', description: 'Pick roster (manual or auto-pick)' },
-+        {
-+          type: 1,
-+          name: 'select',
-+          description: 'Pick roster (manual or auto-pick)',
-+          options: [{ type: 4, name: 'war', description: 'War ID', required: false }],
-+        },
-         { type: 1, name: 'help', description: 'Show WarBot help and quick reference' },
--        { type: 1, name: 'simulate', description: 'Admin: seed 10 fake signups (testing only)' },
-+        {
-+          type: 1,
-+          name: 'simulate',
-+          description: 'Admin: seed 10 fake signups (testing only)',
-+          options: [{ type: 4, name: 'war', description: 'War ID', required: false }],
-+        },
-       ],
-     },
-   ];
-   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-   await rest.put(
-     Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-     { body: commands }
-   );
-   console.log('✅ Registered /warbot commands');
- }
- 
- /* ============== READY ============== */
- client.once(Events.ClientReady, async () => {
-   console.log(`✅ Logged in as ${client.user.tag}`);
-   initDB();
-   await initSheets();
-   await registerCommands();
- });
- 
- /* ============== INTERACTIONS ============== */
- client.on('interactionCreate', async (interaction) => {
-   try {
-     /* ---------- SLASH ---------- */
-     if (interaction.isChatInputCommand()) {
-       if (interaction.commandName !== 'warbot') return;
-       const sub = interaction.options.getSubcommand();
- 
-       // HELP
-       if (sub === 'help') {
-         const embed = new EmbedBuilder()
-           .setTitle('WarBot — Quick Reference')
-           .setColor(0x5865f2)
-           .setDescription(
-             [
-               '**Users**',
-               '• React 👍 to sign up; unreact to drop out.\n• You will be DM’d if selected as **starter** or **backup**.',
-               '',
-               '**Admins / Managers / Captains**',
-               '• `/warbot new` → dropdowns for team size & format → opponent → time.',
--              '• `/warbot select` → **Manual Pick** or **Auto-pick First N**; DMs go out; embed updates.',
-+              '• `/warbot select [war]` → **Manual Pick** or **Auto-pick First N**; DMs go out; embed updates.',
-               '• If a starter drops after lock, roster unlocks and admins are pinged to re-select.',
-               '',
-               '**Cancel**',
-               '• React 🛑 on the sign-up (admins only) to cancel & delete the post.',
-             ].join('\n')
-           );
-         const row = new ActionRowBuilder().addComponents(
-           new ButtonBuilder().setCustomId('help:full').setLabel('Show full tutorial (DM)').setStyle(ButtonStyle.Primary)
-         );
-         return interaction.reply({ ephemeral: true, embeds: [embed], components: [row] });
-       }
- 
-       // SIMULATE
-       if (sub === 'simulate') {
-         if (!isAdminish(interaction.member)) {
-           return interaction.reply({ ephemeral: true, content: 'No permission.' });
-         }
--        const warMsg = await findLatestWarMessageInChannel(interaction.channel);
-+        const idOpt = interaction.options.getInteger('war');
-+        const warMsg = idOpt
-+          ? await findWarMessageInChannelById(interaction.channel, idOpt)
-+          : await findLatestWarMessageInChannel(interaction.channel);
-         if (!warMsg) {
-           return interaction.reply({ ephemeral: true, content: 'No active War Sign-up here. Run /warbot new first.' });
-         }
-         const war = wars.get(warMsg.id);
-         const already = war.pool.size;
-         for (let i = 1; i <= 10; i++) {
-           const fakeId = `9990000000000${String(i).padStart(2, '0')}`;
-           if (!war.pool.has(fakeId)) {
-             war.pool.set(fakeId, { name: `FakeUser${i}`, joinedISO: new Date(Date.now() + i * 500).toISOString() });
-           }
-         }
-         await updateSignupEmbed(warMsg);
-         if (war.pool.size >= war.teamSize && !war.locked && process.env.ADMIN_PING_ROLE_ID) {
-           await interaction.channel.send({ content: `<@&${process.env.ADMIN_PING_ROLE_ID}> ${war.teamSize}+ signed up (simulation).` });
-         }
-         return interaction.reply({ ephemeral: true, content: `✅ Seeded ${war.pool.size - already} fake signups (now ${war.pool.size} in pool).` });
-       }
- 
-       // NEW (dropdown wizard)
-       if (sub === 'new') {
-         if (!isAdminish(interaction.member)) {
-           return interaction.reply({ ephemeral: true, content: 'You do not have permission to create wars.' });
-         }
-         newWizard.set(interaction.user.id, { teamSize: null, format: null, opponent: null });
- 
-diff --git a/index.js b/index.js
-index 0060ed45fa9b4dc492c437111c32f1c97f499752..cc2392c047ebbae43a7fa9c8f621af9b2a89fb31 100644
---- a/index.js
-+++ b/index.js
-@@ -220,81 +246,84 @@ client.on('interactionCreate', async (interaction) => {
-           .setPlaceholder('Select format')
-           .addOptions({ label: 'Best of 3', value: 'bo3' }, { label: 'Best of 5', value: 'bo5' });
- 
-         const nextBtn = new ButtonBuilder()
-           .setCustomId('new:next')
-           .setLabel('Next: Opponent & Time')
-           .setStyle(ButtonStyle.Primary)
-           .setDisabled(true);
- 
-         return interaction.reply({
-           ephemeral: true,
-           content: 'Set up your War Sign-up:',
-           components: [
-             new ActionRowBuilder().addComponents(sizeSelect),
-             new ActionRowBuilder().addComponents(formatSelect),
-             new ActionRowBuilder().addComponents(nextBtn),
-           ],
-         });
-       }
- 
-       // SELECT (present options)
-       if (sub === 'select') {
-         if (!isAdminish(interaction.member)) {
-           return interaction.reply({ ephemeral: true, content: 'No permission.' });
-         }
--        const warMsg = await findLatestWarMessageInChannel(interaction.channel);
-+        const idOpt = interaction.options.getInteger('war');
-+        const warMsg = idOpt
-+          ? await findWarMessageInChannelById(interaction.channel, idOpt)
-+          : await findLatestWarMessageInChannel(interaction.channel);
-         if (!warMsg) {
-           return interaction.reply({ ephemeral: true, content: 'No War Sign-up found in this channel.' });
-         }
-         const war = wars.get(warMsg.id);
-         const poolArr = sortedPoolArray(war);
-         if (poolArr.length < war.teamSize) {
-           return interaction.reply({ ephemeral: true, content: `Need at least ${war.teamSize} sign-ups (currently ${poolArr.length}).` });
-         }
- 
-         // Controls: manual or auto
-         const row = new ActionRowBuilder().addComponents(
-           new ButtonBuilder()
-             .setCustomId(`select:auto:${warMsg.id}`)
-             .setLabel(`Auto-pick First ${war.teamSize}`)
-             .setStyle(ButtonStyle.Success),
-           new ButtonBuilder().setCustomId(`select:manual:${warMsg.id}`).setLabel('Manual Pick').setStyle(ButtonStyle.Primary)
-         );
-         return interaction.reply({ ephemeral: true, content: 'Choose how to select the roster:', components: [row] });
-       }
-     }
- 
-     /* ---------- BUTTONS ---------- */
-     if (interaction.isButton()) {
-       // Help → DM
-       if (interaction.customId === 'help:full') {
-         const longText =
-           '📖 **WarBot Full Tutorial**\n\n' +
-           '1) `/warbot new` → choose team size & format, enter opponent, pick time.\n' +
-           '2) Players react 👍 to join; unreact to drop.\n' +
--          '3) `/warbot select` → Manual Pick or Auto-pick; DMs go out; embed updates.\n' +
-+          '3) `/warbot select [war]` → Manual Pick or Auto-pick; DMs go out; embed updates.\n' +
-           '4) If a starter drops after lock, admins are pinged to re-select; if no backups, recruitment is pinged.\n' +
-           '5) 🛑 on the sign-up (admins) cancels & deletes.';
-         try {
-           await interaction.user.send(longText);
-           return interaction.reply({ ephemeral: true, content: '📬 Sent you the full tutorial in DMs.' });
-         } catch {
-           return interaction.reply({ ephemeral: true, content: '❌ Could not DM you (DMs closed).' });
-         }
-       }
- 
-       // NEW → Next → Opponent modal
-       if (interaction.customId === 'new:next') {
-         const wiz = newWizard.get(interaction.user.id);
-         if (!wiz || !wiz.teamSize || !wiz.format) {
-           return interaction.reply({ ephemeral: true, content: 'Please select both Team Size and Format first.' });
-         }
-         const modal = new ModalBuilder().setCustomId('new:oppmodal').setTitle('Opponent Name');
-         const oppInput = new TextInputBuilder().setCustomId('new:opp').setLabel('Opponent').setStyle(TextInputStyle.Short).setRequired(true);
-         modal.addComponents(new ActionRowBuilder().addComponents(oppInput));
-         return interaction.showModal(modal);
-       }
- 
-       // SELECT → Auto-pick
-       if (interaction.customId.startsWith('select:auto:')) {
-         if (!isAdminish(interaction.member)) {
-diff --git a/index.js b/index.js
-index 0060ed45fa9b4dc492c437111c32f1c97f499752..cc2392c047ebbae43a7fa9c8f621af9b2a89fb31 100644
---- a/index.js
-+++ b/index.js
-@@ -442,54 +471,61 @@ client.on('interactionCreate', async (interaction) => {
-             new ActionRowBuilder().addComponents(formatSelect),
-             new ActionRowBuilder().addComponents(nextBtn),
-           ],
-         });
-       }
- 
-       // NEW → time (after modal)
-       if (interaction.customId.startsWith('new:time:')) {
-         const [, , sizeStr, fmt, oppEnc] = interaction.customId.split(':');
-         const sizeNum = Number(sizeStr);
-         const opp = decodeURIComponent(oppEnc);
-         const iso = interaction.values[0];
- 
-         const warChannelId = process.env.WAR_CHANNEL_ID || interaction.channelId;
-         const warChannel = interaction.guild.channels.cache.get(warChannelId) || interaction.channel;
- 
-         const startET = etString(iso);
-         const description = [
-           `**Opponent:** ${opp}`,
-           `**Format:** ${fmt.toUpperCase()}`,
-           `**Start (ET):** ${startET}`,
-           '',
-           'React 👍 to join. Unreact to drop out.',
-         ].join('\n');
- 
--        const embed = new EmbedBuilder().setTitle('War Sign-up').setColor(0x2ecc71).setDescription(description).setFooter({ text: `Team size: ${sizeNum}v${sizeNum}` });
-+        const warId = nextWarId++;
-+        const embed = new EmbedBuilder()
-+          .setTitle(`War Sign-up #${warId}`)
-+          .setColor(0x2ecc71)
-+          .setDescription(description)
-+          .setFooter({ text: `Team size: ${sizeNum}v${sizeNum}` });
-         const msg = await warChannel.send({ embeds: [embed] });
- 
-         wars.set(msg.id, {
-+          id: warId,
-+          channelId: warChannel.id,
-           teamSize: sizeNum,
-           pool: new Map(),
-           starters: [],
-           backups: [],
-           locked: false,
-           meta: { opponent: opp, format: fmt, startET },
-         });
- 
-         try { await msg.react('👍'); } catch {}
-         try { await msg.react('🛑'); } catch {}
- 
-         newWizard.delete(interaction.user.id);
-         return interaction.update({ content: `✅ Created sign-up in <#${warChannel.id}>.`, components: [] });
-       }
- 
-       // SELECTOR: manual pick starters
-       if (interaction.customId.startsWith('select:pick:')) {
-         const [, , warMsgId, sizeStr] = interaction.customId.split(':');
-         const teamSize = Number(sizeStr);
-         const selected = interaction.values; // array of userIds
-         // store pending starters on the war; confirm button enables now
-         const channel = interaction.channel;
-         const warMsg = await channel.messages.fetch(warMsgId).catch(() => null);
-         if (!warMsg || !wars.has(warMsg.id)) {
-           return interaction.reply({ ephemeral: true, content: 'War Sign-up not found.' });
-
-          channelId: warChannel.id,
-          teamSize: sizeNum,
-          pool: new Map(),
-          starters: [],
-          backups: [],
-          locked: false,
-          meta: { opponent: opp, format: fmt, startET },
-        });
-
-        try { await msg.react('👍'); } catch {}
-        try { await msg.react('🛑'); } catch {}
-
-        newWizard.delete(interaction.user.id);
-        return interaction.update({ content: `✅ Created sign-up in <#${warChannel.id}>.`, components: [] });
-      }
-
-      // SELECTOR: manual pick starters
-      if (interaction.customId.startsWith('select:pick:')) {
-        const [, , warMsgId, sizeStr] = interaction.customId.split(':');
-        const teamSize = Number(sizeStr);
-        const selected = interaction.values; // array of userIds
-        // store pending starters on the war; confirm button enables now
-        const channel = interaction.channel;
-        const warMsg = await channel.messages.fetch(warMsgId).catch(() => null);
-        if (!warMsg || !wars.has(warMsg.id)) {
-          return interaction.reply({ ephemeral: true, content: 'War Sign-up not found.' });
-        }
-        const war = wars.get(warMsg.id);
-        if (selected.length !== teamSize) {
-          return interaction.reply({ ephemeral: true, content: `Please pick exactly ${teamSize} starters.` });
-        }
-        war._pendingStarters = selected;
-
-        // Rebuild the UI with confirm enabled
-        const poolArr = sortedPoolArray(war);
-        const options = poolArr.slice(0, 25).map((p) => ({
-          label: p.name,
-          value: `${p.userId}`,
-          description: `Joined ${new Date(p.joinedISO).toLocaleTimeString()}`,
-        }));
-        const select = new StringSelectMenuBuilder()
-          .setCustomId(`select:pick:${warMsg.id}:${teamSize}`)
-          .setPlaceholder(`Pick exactly ${teamSize} starters`)
-          .setMinValues(teamSize)
-          .setMaxValues(teamSize)
-          .addOptions(options);
-        const confirm = new ButtonBuilder().setCustomId(`select:confirm:${warMsg.id}`).setLabel('Confirm Roster').setStyle(ButtonStyle.Success).setDisabled(false);
-
-        return interaction.update({
-          content: `Selected **${teamSize}** starters. Click **Confirm Roster** to lock.`,
-          components: [new ActionRowBuilder().addComponents(select), new ActionRowBuilder().addComponents(confirm)],
-        });
-      }
-    }
-
-    /* ---------- MODALS ---------- */
-    if (interaction.isModalSubmit() && interaction.customId === 'new:oppmodal') {
-      const wiz = newWizard.get(interaction.user.id);
-      if (!wiz || !wiz.teamSize || !wiz.format) {
-        return interaction.reply({ ephemeral: true, content: 'Setup expired. Run /warbot new again.' });
-      }
-      const opponent = interaction.fields.getTextInputValue('new:opp').trim();
-      if (!opponent) {
-        return interaction.reply({ ephemeral: true, content: 'Please enter an opponent.' });
-      }
-      wiz.opponent = opponent;
-      newWizard.set(interaction.user.id, wiz);
-
-      // Time picker (72h, 30-min slots) with simple pagination
-      const now = new Date();
-      now.setMinutes(now.getMinutes() - (now.getMinutes() % 30), 0, 0);
-      const slots = 72 * 2;
-      const options = [];
-      for (let i = 0; i < slots; i++) {
-        const d = new Date(now.getTime() + i * 30 * 60 * 1000);
-        const et = d.toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: true, month: 'short', day: '2-digit' });
-        options.push({ label: et, value: d.toISOString() });
-      }
-      const size = wiz.teamSize;
-      const fmt = wiz.format;
-      const oppEnc = encodeURIComponent(wiz.opponent);
-
-      const select = new StringSelectMenuBuilder()
-        .setCustomId(`new:time:${size}:${fmt}:${oppEnc}`)
-        .setPlaceholder('Select start time (ET)')
-        .setMinValues(1)
-        .setMaxValues(1)
-        .addOptions(options.slice(0, 25));
-
-      const nextBtn = new ButtonBuilder().setCustomId(`new:timepage:1:${size}:${fmt}:${oppEnc}`).setLabel('Next Page').setStyle(ButtonStyle.Secondary);
-
-      return interaction.reply({
+    // Opponent modal
+    if (interaction.isModalSubmit() && interaction.customId === 'wb:w:oppmodal') {
+      const uid = interaction.user.id;
+      const st = wizardState.get(uid);
+      if (!st) return;
+      st.opponent = interaction.fields.getTextInputValue('wb:w:opptxt');
+      await interaction.reply({
+        content: `🧭 **War Wizard** — **War ID ${st.warId}**\nOpponent: **${st.opponent}**\nPick a **Start Time (ET)** below.`,
+        components: [timeMenu(st.startET), nextButtons(false)],
         ephemeral: true,
-        content: 'Pick a start time (ET).',
-        components: [new ActionRowBuilder().addComponents(select), new ActionRowBuilder().addComponents(nextBtn)],
       });
+      return;
     }
 
-    /* ---------- TIME PAGE BUTTONS ---------- */
-    if (interaction.isButton() && interaction.customId.startsWith('new:timepage:')) {
-      const [, , pageStr, sizeStr, fmt, oppEnc] = interaction.customId.split(':');
-      const page = parseInt(pageStr, 10);
-      const sizeNum = Number(sizeStr);
-      const opp = decodeURIComponent(oppEnc);
-
-      const now = new Date();
-      now.setMinutes(now.getMinutes() - (now.getMinutes() % 30), 0, 0);
-      const slots = 72 * 2;
-      const allOptions = [];
-      for (let i = 0; i < slots; i++) {
-        const d = new Date(now.getTime() + i * 30 * 60 * 1000);
-        const et = d.toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: true, month: 'short', day: '2-digit' });
-        allOptions.push({ label: et, value: d.toISOString() });
+    // Manual lock modal
+    if (interaction.isModalSubmit() && interaction.customId === 'wb:m:manual') {
+      const adminId = interaction.user.id;
+      const pending = pendingManual.get(adminId);
+      if (!pending) {
+        await interaction.reply({ content: 'This manual lock session expired. Please run /warbot select again.', ephemeral: true });
+        return;
       }
-      const perPage = 25;
-      const total = Math.ceil(allOptions.length / perPage);
-      const idx = Math.max(0, Math.min(page, total - 1));
-      const opts = allOptions.slice(idx * perPage, idx * perPage + perPage);
+      pendingManual.delete(adminId);
 
-      const select = new StringSelectMenuBuilder()
-        .setCustomId(`new:time:${sizeNum}:${fmt}:${encodeURIComponent(opp)}`)
-        .setPlaceholder(`Select start time (page ${idx + 1}/${total})`)
-        .setMinValues(1)
-        .setMaxValues(1)
-        .addOptions(opts);
+      const warId = pending.warId;
+      const startersRaw = interaction.fields.getTextInputValue('wb:m:starters') || '';
+      const backupsRaw  = interaction.fields.getTextInputValue('wb:m:backups') || '';
 
-      const buttons = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`new:timepage:${Math.max(idx - 1, 0)}:${sizeNum}:${fmt}:${encodeURIComponent(opp)}`).setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(idx === 0),
-        new ButtonBuilder().setCustomId(`new:timepage:${Math.min(idx + 1, total - 1)}:${sizeNum}:${fmt}:${encodeURIComponent(opp)}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(idx >= total - 1)
-      );
+      const parseList = (s) => s.split(',').map(v => v.trim()).filter(Boolean).map(v => v.replace(/^<@!?(\d+)>$/, '$1'));
+      const starters = await resolveUsers(interaction.guild, parseList(startersRaw));
+      const backups  = await resolveUsers(interaction.guild, parseList(backupsRaw));
 
-      return interaction.update({ content: 'Pick a start time (ET).', components: [new ActionRowBuilder().addComponents(select), buttons] });
+      const msg = await interaction.reply({
+        content: `📝 **Manual roster set** for **War ${warId}**.\nPick the map order (last must be Crossroads / Crossroads Night).`,
+        components: buildMapDraftComponents('BO3'),
+        ephemeral: true,
+        fetchReply: true,
+      });
+      pendingLocks.set(adminId, { warId, starters, backups, format: 'BO3', stepMsgId: msg.id });
+      return;
+    }
+
+    // Map draft selects & finalize
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('wb:d:')) {
+      const adminId = interaction.user.id;
+      const pend = pendingLocks.get(adminId);
+      if (!pend) return;
+      const idx = Number(interaction.customId.split(':')[2]);
+      pend[`map${idx}`] = interaction.values[0];
+      await interaction.update({ components: buildMapDraftComponents(pend.format, pend) });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'wb:d:finalize') {
+      const adminId = interaction.user.id;
+      const pend = pendingLocks.get(adminId);
+      if (!pend) {
+        await interaction.reply({ content: 'This draft session expired. Run /warbot select again.', ephemeral: true });
+        return;
+      }
+
+      const { warId, starters, backups, format } = pend;
+      const needed = format === 'BO5' ? 5 : 3;
+      const selectedMaps = [];
+      for (let i = 1; i <= needed; i++) {
+        const name = pend[`map${i}`];
+        if (!name) {
+          await interaction.reply({ content: `Please select Map ${i} before finalizing.`, ephemeral: true });
+          return;
+        }
+        selectedMaps.push(name);
+      }
+      const last = selectedMaps[selectedMaps.length - 1];
+      if (last !== 'Crossroads - Demolition' && last !== 'Crossroads Night - Demolition') {
+        await interaction.reply({ content: `The last map must be Crossroads or Crossroads Night.`, ephemeral: true });
+        return;
+      }
+
+      // Persist to Sheets (opponent/startET can be pushed if you also store them at creation)
+      await pushWarLock({ warId, opponent: 'TBD', format, startET: 'TBD', starters, backups });
+      for (let i = 0; i < selectedMaps.length; i++) await pushAddedMap({ warId, mapOrder: i + 1, mapName: selectedMaps[i] });
+
+      // DMs
+      await dmList(starters, `✅ You have been selected as a **starter** for War #${warId}.`);
+      await dmList(backups,  `🕒 You are a **backup** for War #${warId}. Stay ready!`);
+
+      // Optional roster ping (auto-delete)
+      if (process.env.PING_ROSTER_ROLE_ID) {
+        const chId = process.env.WAR_CHANNEL_ID;
+        const ch = chId ? await client.channels.fetch(chId).catch(()=>null) : null;
+        if (ch && ch.isTextBased()) {
+          const pingMsg = await ch.send({ content: `<@&${process.env.PING_ROSTER_ROLE_ID}> Roster locked for **War #${warId}**.` }).catch(()=>null);
+          if (pingMsg && CLEANUP_MS > 0) setTimeout(() => pingMsg.delete().catch(()=>{}), CLEANUP_MS);
+        }
+      }
+
+      // Update signup embed with rosters (keep War ID visible)
+      const msgId = warToMessage.get(String(warId));
+      if (msgId) {
+        try {
+          const ch = await client.channels.fetch(process.env.WAR_CHANNEL_ID).catch(()=>null);
+          const msg = ch ? await ch.messages.fetch(msgId).catch(()=>null) : null;
+          if (msg) {
+            let base = msg.embeds[0]?.toJSON?.() || { title: `War Sign-up #${warId}`, description: '' };
+            const startersStr = starters.map(p => p.name).join(', ') || '_none_';
+            const backupsStr  = backups.map(p  => p.name).join(', ')  || '_none_';
+            base.description = base.description.replace(/\n?\*\*Signed up.*$/s, '') +
+              `\n\n**Starters:** ${startersStr}\n**Backups:** ${backupsStr}\n_(Sign-ups remain open for backups)_`;
+            base = embedWithWarId(base, warId);
+            await msg.edit({ embeds: [base] });
+          }
+        } catch (e) { console.error('Update signup after lock failed:', e?.stack || e); }
+      }
+
+      pendingLocks.delete(adminId);
+      await interaction.reply({ content: `✅ Roster locked for **War #${warId}**. DMs sent.`, ephemeral: true });
+      return;
     }
   } catch (err) {
-    console.error('interaction error:', err);
-    if (interaction.isRepliable()) {
-      try { await interaction.reply({ ephemeral: true, content: 'Something went wrong.' }); } catch {}
+    console.error('INTERACTION ERROR:', err?.stack || err);
+    if (interaction.isRepliable?.()) {
+      try {
+        if (!interaction.replied && !interaction.deferred) {
+          await interaction.reply({ content: '⚠️ Something went wrong. Try again.', flags: 1 << 6 });
+        } else if (interaction.deferred) {
+          await interaction.editReply({ content: '⚠️ Something went wrong. Try again.' });
+        }
+      } catch {}
     }
   }
 });
 
-/* ============== ROSTER DM TEXTS ============== */
-function starterDM(war) {
-  const opp = war.meta?.opponent ?? 'TBD';
-  const fmt = (war.meta?.format ?? 'bo3').toUpperCase();
-  const when = war.meta?.startET ?? 'TBD (ET)';
-  return (
-    `✅ **You are a STARTER**\n` +
-    `Opponent: **${opp}**\nFormat: **${fmt}**\nStart: **${when}**\n\n` +
-    `If you cannot make it, please unreact on the sign-up ASAP so admins can replace you.`
-  );
-}
-function backupDM(war) {
-  const opp = war.meta?.opponent ?? 'TBD';
-  const fmt = (war.meta?.format ?? 'bo3').toUpperCase();
-  const when = war.meta?.startET ?? 'TBD (ET)';
-  return (
-    `ℹ️ **You are a BACKUP (standby)**\n` +
-    `Opponent: **${opp}**\nFormat: **${fmt}**\nStart: **${when}**\n\n` +
-    `Stay ready. If a starter drops, you may be called up.`
-  );
-}
-
-/* ============== REACTIONS (JOIN / CANCEL / DROP) ============== */
+// ---------- Reaction handlers (👍 join / 🛑 cancel) ----------
 client.on('messageReactionAdd', async (reaction, user) => {
   try {
     if (user.bot) return;
-    if (reaction.partial) await reaction.fetch();
-    if (reaction.message.partial) await reaction.message.fetch();
+    const msg = reaction.message;
+    if (!msg?.id) return;
+    const pool = pools.get(msg.id);
+    if (!pool) return;
 
-    const war = wars.get(reaction.message.id);
-    if (!war) return;
-
-    // Join
     if (reaction.emoji.name === '👍') {
-      if (!war.pool.has(user.id)) {
-        war.pool.set(user.id, { name: user.username, joinedISO: new Date().toISOString() });
-        await updateSignupEmbed(reaction.message);
-        // If roster was unlocked (after a drop), this will help fill backups again
-      }
+      pool.signups.set(user.id, { name: user.username, tsMs: Date.now() });
+
+      const lines = [...pool.signups.entries()].sort((a,b)=>a[1].tsMs-b[1].tsMs).map(([_,v])=>{
+        const dt = new Date(v.tsMs).toLocaleString('en-US',{hour:'numeric',minute:'2-digit',hour12:true,month:'numeric',day:'numeric',timeZone:'America/New_York'});
+        return `${v.name} (${dt} ET)`;
+      });
+
+      let base = msg.embeds[0]?.toJSON?.() || { title: `War Sign-up #${pool.warId}`, description: '' };
+      const signed = `**Signed up (earliest first):**\n${lines.join('\n') || '_none yet_'}`;
+      base.description = base.description.replace(/\n?\*\*Signed up.*$/s, '') + `\n\n${signed}`;
+      base = embedWithWarId(base, pool.warId);
+      await msg.edit({ embeds: [base] }).catch(()=>{});
     }
 
-    // Cancel whole sign-up (admins only)
     if (reaction.emoji.name === '🛑') {
-      const member = await reaction.message.guild.members.fetch(user.id).catch(() => null);
-      if (!isAdminish(member)) return;
-      try { await reaction.message.delete(); } catch {}
-      wars.delete(reaction.message.id);
-      await reaction.message.channel.send('🛑 War sign-up **cancelled**.');
+      // delete thread if exists
+      try {
+        const threadId = warToThread.get(String(pool.warId));
+        if (threadId) {
+          const thread = await client.channels.fetch(threadId).catch(()=>null);
+          if (thread && thread.isThread()) await thread.delete().catch(()=>{});
+          warToThread.delete(String(pool.warId));
+        }
+      } catch {}
+      await msg.delete().catch(()=>{});
+      pools.delete(msg.id);
+      warToMessage.forEach((mid, wid) => { if (mid === msg.id) warToMessage.delete(wid); });
     }
   } catch (e) {
-    console.error('messageReactionAdd error:', e);
+    console.error('REACTION ADD ERROR:', e?.stack || e);
   }
 });
-
 client.on('messageReactionRemove', async (reaction, user) => {
   try {
     if (user.bot) return;
-    if (reaction.partial) await reaction.fetch();
-    if (reaction.message.partial) await reaction.message.fetch();
+    const msg = reaction.message;
+    if (!msg?.id) return;
+    const pool = pools.get(msg.id);
+    if (!pool) return;
 
-    const war = wars.get(reaction.message.id);
-    if (!war) return;
-
-    // Drop
     if (reaction.emoji.name === '👍') {
-      const wasIn = war.pool.delete(user.id);
-      if (wasIn) {
-        // If locked and a starter dropped, unlock + ping admins
-        if (war.locked && war.starters?.includes(user.id)) {
-          war.locked = false;
-          war.starters = war.starters.filter((id) => id !== user.id);
-          // Try to auto-promote first backup if any
-          if (war.backups?.length) {
-            const next = war.backups.shift();
-            if (next) war.starters.push(next);
-          }
-          // Ping admins; also recruit if no backups remain
-          const alerts = [];
-          if (process.env.ADMIN_PING_ROLE_ID) alerts.push(`<@&${process.env.ADMIN_PING_ROLE_ID}>`);
-          let msg = `${alerts.join(' ')} A starter dropped; roster **unlocked**. Please re-select starters with \`/warbot select\`.`;
-          if (!war.backups?.length && process.env.RECRUIT_PING_ROLE_ID) {
-            msg += `\n<@&${process.env.RECRUIT_PING_ROLE_ID}> No backups remain—please recruit!`;
-          }
-          await reaction.message.channel.send(msg);
-        }
-        await updateSignupEmbed(reaction.message);
-      }
+      pool.signups.delete(user.id);
+
+      const lines = [...pool.signups.entries()].sort((a,b)=>a[1].tsMs-b[1].tsMs).map(([_,v])=>{
+        const dt = new Date(v.tsMs).toLocaleString('en-US',{hour:'numeric',minute:'2-digit',hour12:true,month:'numeric',day:'numeric',timeZone:'America/New_York'});
+        return `${v.name} (${dt} ET)`;
+      });
+
+      let base = msg.embeds[0]?.toJSON?.() || { title: `War Sign-up #${pool.warId}`, description: '' };
+      const signed = `**Signed up (earliest first):**\n${lines.join('\n') || '_none yet_'}`;
+      base.description = base.description.replace(/\n?\*\*Signed up.*$/s, '') + `\n\n${signed}`;
+      base = embedWithWarId(base, pool.warId);
+      await msg.edit({ embeds: [base] }).catch(()=>{});
     }
   } catch (e) {
-    console.error('messageReactionRemove error:', e);
+    console.error('REACTION REMOVE ERROR:', e?.stack || e);
   }
 });
 
-/* ============== LOGIN ============== */
-client.login(process.env.DISCORD_TOKEN);
+// ---------- Helpers ----------
+async function resolveUsers(guild, arr) {
+  const out = [];
+  for (const token of arr) {
+    let userId = token;
+    let name = token;
+    if (/^\d{15,20}$/.test(token)) {
+      const m = await guild.members.fetch(token).catch(()=>null);
+      if (m) { userId = m.id; name = m.user.username; }
+    } else if (token.startsWith('@')) {
+      const q = token.slice(1).toLowerCase();
+      const m = guild.members.cache.find(u => u.user.username.toLowerCase() === q);
+      if (m) { userId = m.id; name = m.user.username; }
+    }
+    out.push({ userId, name });
+  }
+  return out;
+}
+async function dmList(list, text) {
+  for (const p of list) {
+    try {
+      const u = await client.users.fetch(p.userId).catch(()=>null);
+      if (u) await u.send(text).catch(()=>{});
+    } catch {}
+  }
+}
 
-/* =================== NOTES ===================
-ENV (set any you need):
-DISCORD_TOKEN=
-CLIENT_ID=
-GUILD_ID=
-WAR_CHANNEL_ID=           (optional)
-ROLE_ADMIN=               (optional)
-ROLE_MANAGER=             (optional)
-ROLE_KEEPER=              (optional)
-ROLE_CAPTAIN=             (optional)
-ADMIN_PING_ROLE_ID=       (optional)
-RECRUIT_PING_ROLE_ID=     (optional)
-*/
+// ---------- Startup ----------
+client.once('clientReady', async () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+  await initSheets();
+  initDB();
+  await registerCommands();
+});
+client.login(process.env.DISCORD_TOKEN);
