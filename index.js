@@ -1,3 +1,5 @@
+// WarBot100 test: confirming GitHub push + commit log
+
 // index.js — WarBot PRODUCTION (sticky wizard + War ID always visible + Render-friendly)
 
 // ---------- Crash guards ----------
@@ -11,7 +13,9 @@ import {
   Client,
   GatewayIntentBits,
   Partials,
-  REST,
+  REST,rm -f 0
+git apply --check warbot.patch
+
   Routes,
   SlashCommandBuilder,
   ActionRowBuilder,
