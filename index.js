@@ -1,11 +1,8 @@
-// index.js — Two-step wizard to avoid timeouts & simplify UX
-// Step A: /warbot new -> showModal (initial response)
-// Step B: ephemeral reply with Date/Time dropdowns -> Create Sign-up
-// Also supports /warbot cancel war_id, 👍 join, 👎 opt-out, 🛑 cancel
-// Requires env: DISCORD_TOKEN, CLIENT_ID, GUILD_ID, WAR_CHANNEL_ID (+ your Sheets env)
+// index.js — Single-page setup panel with dropdowns + one "Set Opponent" modal
+// Env: DISCORD_TOKEN, CLIENT_ID, GUILD_ID, WAR_CHANNEL_ID (+ your Sheets env vars)
 
-process.on('unhandledRejection', (e) => console.error('UNHANDLED REJECTION:', e));
-process.on('uncaughtException', (e) => console.error('UNCAUGHT EXCEPTION:', e));
+process.on('unhandledRejection', e => console.error('UNHANDLED REJECTION:', e));
+process.on('uncaughtException', e => console.error('UNCAUGHT EXCEPTION:', e));
 
 import 'dotenv/config';
 import http from 'http';
@@ -31,15 +28,15 @@ if (Number.isFinite(RENDER_PORT) && RENDER_PORT > 0) {
 }
 
 /* ---------------- In-memory state ---------------- */
-/** wizard[userId] = { warId, opponent, teamSize, format, dateISO, dateLabel, timeValue, timeLabel, startET } */
-const wizard = new Map();
+/** state[userId] = { warId, opponent, teamSize, format, dateISO, dateLabel, timeValue, timeLabel, startET } */
+const state = new Map();
 /** pools[msgId] = { warId, signups: Map<userId,{name,tsMs}>, declines: Map<userId,{name,tsMs}> } */
 const pools = new Map();
 /** warId -> messageId */
 const warToMessage = new Map();
 
 /* ---------------- Helpers ---------------- */
-function embedWithWarId(base, warId) {
+function ensureWarEmbed(base, warId) {
   const id = String(warId);
   const title = `War Sign-up #${id}`;
   const desc = base.description?.includes('**War ID:**')
@@ -51,14 +48,15 @@ function embedWithWarId(base, warId) {
 function etAddDays(days) {
   const now = new Date();
   const d = new Date(now.getTime() + days * 86400000);
-  d.setUTCHours(16, 0, 0, 0); // anchor
+  d.setUTCHours(16, 0, 0, 0); // anchor ~noon ET for stable label
   return d;
 }
 function etDateLabel(d) {
   return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/New_York' });
 }
 function etYYYYMMDD(d) {
-  return new Intl.DateTimeFormat('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit', timeZone: 'America/New_York' }).format(d);
+  return new Intl.DateTimeFormat('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit', timeZone: 'America/New_York' })
+    .format(d);
 }
 function buildDateChoices7() {
   const opts = [];
@@ -75,7 +73,7 @@ function buildTimeChoicesEvening() {
     const label = new Date(Date.UTC(2000, 0, 1, h, m)).toLocaleTimeString('en-US', {
       hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
     });
-    const val = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+    const val = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
     times.push({ label, value: val });
     m += 30;
     if (m >= 60) { m = 0; h += 1; }
@@ -84,6 +82,29 @@ function buildTimeChoicesEvening() {
   return times;
 }
 
+function teamSizeMenu(selected) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('wb:size')
+      .setPlaceholder('Team Size (6 / 7 / 8)')
+      .addOptions(
+        { label: '6v6', value: '6', default: selected === '6' },
+        { label: '7v7', value: '7', default: selected === '7' },
+        { label: '8v8', value: '8', default: selected === '8' },
+      )
+  );
+}
+function formatMenu(selected) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('wb:format')
+      .setPlaceholder('Format (BO3 / BO5)')
+      .addOptions(
+        { label: 'Best of 3', value: 'BO3', default: selected === 'BO3' },
+        { label: 'Best of 5', value: 'BO5', default: selected === 'BO5' },
+      )
+  );
+}
 function dateMenu(selectedValue) {
   const opts = buildDateChoices7().map(o => ({ ...o, default: selectedValue === o.value }));
   return new ActionRowBuilder().addComponents(
@@ -102,17 +123,22 @@ function timeMenu(selectedValue) {
       .addOptions(...opts)
   );
 }
-function createButtons(enabled) {
+function opponentButtons(hasOpponent, ready) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('wb:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success).setDisabled(!enabled),
+    new ButtonBuilder().setCustomId('wb:setopp').setLabel(hasOpponent ? 'Change Opponent' : 'Set Opponent').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('wb:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success).setDisabled(!ready),
     new ButtonBuilder().setCustomId('wb:cancelwiz').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
   );
 }
-function miniSummary(st) {
-  return `Opponent: **${st.opponent || '—'}** | Team: **${st.teamSize || '—'}v${st.teamSize || '—'}** | Format: **${st.format || '—'}**\n` +
-         `Date: **${st.dateLabel || '—'}** | Time: **${st.timeLabel || '—'}**`;
+function summary(st) {
+  return `**War ID:** ${st.warId}\n` +
+         `Opponent: **${st.opponent || '—'}**  |  Team: **${st.teamSize || '—'}v${st.teamSize || '—'}**  |  Format: **${st.format || '—'}**\n` +
+         `Date: **${st.dateLabel || '—'}**  |  Time: **${st.timeLabel || '—'}**`;
 }
-function formatLines(map) {
+function canCreate(st) {
+  return !!(st.opponent && st.teamSize && st.format && st.dateLabel && (st.timeLabel || st.timeValue));
+}
+function linesFrom(map) {
   const list = [...map.values()].sort((a,b) => a.tsMs - b.tsMs);
   if (!list.length) return '_none yet_';
   return list.map(v => {
@@ -130,7 +156,7 @@ async function registerCommands() {
     new SlashCommandBuilder()
       .setName('warbot')
       .setDescription('WarBot controls')
-      .addSubcommand(s => s.setName('new').setDescription('Create a War Sign-up (wizard)'))
+      .addSubcommand(s => s.setName('new').setDescription('Create a War Sign-up'))
       .addSubcommand(s => s.setName('cancel').setDescription('Cancel a War Sign-up by War ID')
         .addIntegerOption(o => o.setName('war_id').setDescription('War ID to cancel').setRequired(true)))
   ].map(c => c.toJSON());
@@ -156,25 +182,38 @@ const client = new Client({
 /* ---------------- Interaction flow ---------------- */
 client.on('interactionCreate', async (interaction) => {
   try {
-    /* ---- /warbot new -> show modal immediately (initial response) ---- */
+    /* ---- /warbot new -> single-page setup panel (ephemeral) ---- */
     if (interaction.isChatInputCommand() && interaction.commandName === 'warbot' && interaction.options.getSubcommand() === 'new') {
-      const modal = new ModalBuilder().setCustomId('wb:new:modal').setTitle('New War — Step A');
+      // Reply immediately to avoid timeouts
+      await interaction.reply({ content: '⏳ Preparing setup…', flags: 1 << 6 });
 
-      const opp = new TextInputBuilder()
-        .setCustomId('opp').setLabel('Opponent').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(50);
+      // Get War ID early
+      let warId;
+      try { warId = await getNextWarId(); }
+      catch { warId = null; }
+      if (!Number.isInteger(warId)) {
+        const n = new Date();
+        warId = Number(`${n.getUTCFullYear()}${String(n.getUTCMonth()+1).padStart(2,'0')}${String(n.getUTCDate()).padStart(2,'0')}${String(n.getUTCHours()).padStart(2,'0')}${String(n.getUTCMinutes()).padStart(2,'0')}`);
+      }
 
-      const size = new TextInputBuilder()
-        .setCustomId('size').setLabel('Team Size (6 / 7 / 8)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(2);
+      state.set(interaction.user.id, {
+        warId, opponent: null, teamSize: null, format: null,
+        dateISO: null, dateLabel: null, timeValue: null, timeLabel: null, startET: null
+      });
 
-      const fmt = new TextInputBuilder()
-        .setCustomId('fmt').setLabel('Format (BO3 / BO5)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(3);
-
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(opp),
-        new ActionRowBuilder().addComponents(size),
-        new ActionRowBuilder().addComponents(fmt),
-      );
-      await interaction.showModal(modal);
+      await interaction.editReply({
+        content:
+          `🧭 **War Setup** (single page) — **War ID ${warId}**\n` +
+          `1) Set opponent  2) Pick team size & format  3) Choose date/time  4) Create sign-up\n\n` +
+          summary(state.get(interaction.user.id)),
+        components: [
+          teamSizeMenu(null),
+          formatMenu(null),
+          dateMenu(null),
+          timeMenu(null),
+          opponentButtons(false, false),
+        ],
+      });
       return;
     }
 
@@ -196,134 +235,86 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    /* ---- Modal submit: Step A done -> show Step B (ephemeral) ---- */
-    if (interaction.isModalSubmit() && interaction.customId === 'wb:new:modal') {
-      // Validate inputs
-      const opponent = interaction.fields.getTextInputValue('opp').trim();
-      let size = interaction.fields.getTextInputValue('size').trim();
-      let fmt  = interaction.fields.getTextInputValue('fmt').trim().toUpperCase();
-
-      size = size.replace(/[^\d]/g, '');
-      if (!['6','7','8'].includes(size)) {
-        await interaction.reply({ content: '❌ Team size must be 6, 7, or 8.', flags: 1<<6 });
-        return;
-      }
-      if (!['BO3','BO5'].includes(fmt)) {
-        await interaction.reply({ content: '❌ Format must be BO3 or BO5.', flags: 1<<6 });
-        return;
-      }
-
-      // Compute War ID now
-      let warId;
-      try { warId = await getNextWarId(); }
-      catch { warId = null; }
-      if (!Number.isInteger(warId)) {
-        const n = new Date();
-        warId = Number(`${n.getUTCFullYear()}${String(n.getUTCMonth()+1).padStart(2,'0')}${String(n.getUTCDate()).padStart(2,'0')}${String(n.getUTCHours()).padStart(2,'0')}${String(n.getUTCMinutes()).padStart(2,'0')}`);
-      }
-
-      wizard.set(interaction.user.id, {
-        warId, opponent, teamSize: size, format: fmt,
-        dateISO: null, dateLabel: null, timeValue: null, timeLabel: null, startET: null
-      });
-
-      await interaction.reply({
-        content:
-          `🧭 **War Wizard (Step B)** — **War ID ${warId}**\n` +
-          `${miniSummary(wizard.get(interaction.user.id))}\n\n` +
-          `Pick **Date** and **Time (ET)**, then press **Create Sign-up**.`,
-        components: [dateMenu(null), timeMenu(null), createButtons(false)],
-        flags: 1 << 6, // ephemeral
-      });
-      return;
-    }
-
-    /* ---- Step B: selects & buttons ---- */
+    /* ---- Select menus (single deferUpdate per interaction) ---- */
     if (interaction.isStringSelectMenu()) {
-      const st = wizard.get(interaction.user.id);
+      const st = state.get(interaction.user.id);
       if (!st) return;
 
-      if (interaction.customId === 'wb:date') {
+      if (interaction.customId === 'wb:size') {
+        await interaction.deferUpdate();
+        st.teamSize = interaction.values[0];
+      } else if (interaction.customId === 'wb:format') {
+        await interaction.deferUpdate();
+        st.format = interaction.values[0];
+      } else if (interaction.customId === 'wb:date') {
         await interaction.deferUpdate();
         st.dateISO = interaction.values[0];
         st.dateLabel = buildDateChoices7().find(o => o.value === st.dateISO)?.label || st.dateISO;
         if (st.timeLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
-        const ready = !!(st.dateLabel && (st.timeLabel || st.timeValue));
-        await interaction.editReply({
-          content:
-            `🧭 **War Wizard (Step B)** — **War ID ${st.warId}**\n` +
-            `${miniSummary(st)}\n\nPick **Date** and **Time (ET)**, then press **Create Sign-up**.`,
-          components: [dateMenu(st.dateISO), timeMenu(st.timeValue), createButtons(ready)],
-        });
-        return;
-      }
-
-      if (interaction.customId === 'wb:time') {
-        // "Other…" => open modal (no deferUpdate before showModal)
+      } else if (interaction.customId === 'wb:time') {
+        // Handle Other… without deferring first
         if (interaction.values[0] === 'other') {
           const modal = new ModalBuilder().setCustomId('wb:time:other').setTitle('Custom Time (ET)');
           const txt = new TextInputBuilder()
-            .setCustomId('othertime').setLabel('Enter time in ET (e.g., "1:05 AM" or "13:05")')
-            .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40);
+            .setCustomId('othertime')
+            .setLabel('Enter time in ET (e.g., "1:05 AM" or "13:05")')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(40);
           modal.addComponents(new ActionRowBuilder().addComponents(txt));
           await interaction.showModal(modal);
           return;
+        } else {
+          await interaction.deferUpdate();
+          const val = interaction.values[0];
+          st.timeValue = val;
+          const [H, M] = val.split(':').map(n => parseInt(n, 10));
+          st.timeLabel = new Date(Date.UTC(2000, 0, 1, H, M)).toLocaleTimeString('en-US', {
+            hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
+          });
+          if (st.dateLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
         }
-
-        await interaction.deferUpdate();
-        const val = interaction.values[0];
-        st.timeValue = val;
-        const [H,M] = val.split(':').map(n => parseInt(n, 10));
-        st.timeLabel = new Date(Date.UTC(2000,0,1,H,M)).toLocaleTimeString('en-US', {
-          hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
-        });
-        if (st.dateLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
-        const ready = !!(st.dateLabel && (st.timeLabel || st.timeValue));
-        await interaction.editReply({
-          content:
-            `🧭 **War Wizard (Step B)** — **War ID ${st.warId}**\n` +
-            `${miniSummary(st)}\n\nPress **Create Sign-up** when ready.`,
-          components: [dateMenu(st.dateISO), timeMenu(st.timeValue), createButtons(ready)],
-        });
-        return;
       }
-    }
 
-    if (interaction.isModalSubmit() && interaction.customId === 'wb:time:other') {
-      const st = wizard.get(interaction.user.id);
-      if (!st) return;
-      const txt = interaction.fields.getTextInputValue('othertime').trim();
-      st.timeValue = null;
-      st.timeLabel = txt;
-      if (st.dateLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
-      const ready = !!(st.dateLabel && (st.timeLabel || st.timeValue));
-      await interaction.reply({
-        content:
-          `🧭 **War Wizard (Step B)** — **War ID ${st.warId}**\n` +
-          `${miniSummary(st)}\n\nPress **Create Sign-up** when ready.`,
-        components: [dateMenu(st.dateISO), timeMenu(null), createButtons(ready)],
-        flags: 1 << 6,
+      const ready = canCreate(st);
+      await interaction.editReply({
+        content: `🧭 **War Setup** — **War ID ${st.warId}**\n${summary(st)}`,
+        components: [teamSizeMenu(st.teamSize), formatMenu(st.format), dateMenu(st.dateISO), timeMenu(st.timeValue), opponentButtons(!!st.opponent, ready)],
       });
       return;
     }
 
+    /* ---- Buttons ---- */
     if (interaction.isButton()) {
-      const st = wizard.get(interaction.user.id);
+      const st = state.get(interaction.user.id);
 
       if (interaction.customId === 'wb:cancelwiz') {
         await interaction.deferUpdate();
-        wizard.delete(interaction.user.id);
-        await interaction.editReply({ content: '❌ Wizard cancelled.', components: [] });
+        state.delete(interaction.user.id);
+        await interaction.editReply({ content: '❌ Setup cancelled.', components: [] });
+        return;
+      }
+
+      if (interaction.customId === 'wb:setopp') {
+        // showModal — do not defer first
+        const modal = new ModalBuilder().setCustomId('wb:opp:modal').setTitle('Set Opponent');
+        const opp = new TextInputBuilder()
+          .setCustomId('opp')
+          .setLabel('Opponent')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(50);
+        modal.addComponents(new ActionRowBuilder().addComponents(opp));
+        await interaction.showModal(modal);
         return;
       }
 
       if (interaction.customId === 'wb:create') {
         await interaction.deferUpdate();
-        if (!st || !st.opponent || !st.teamSize || !st.format || !st.dateLabel || !(st.timeLabel || st.timeValue)) {
+        if (!st || !canCreate(st)) {
           await interaction.editReply({ content: '❌ Missing info. Please complete all fields.', components: [] });
           return;
         }
-
         const chId = process.env.WAR_CHANNEL_ID;
         const ch = chId ? await client.channels.fetch(chId).catch(()=>null) : null;
         if (!ch || !ch.isTextBased()) {
@@ -332,7 +323,6 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         const startText = st.startET || `${st.dateLabel}, ${st.timeLabel} ET`;
-
         let embed = {
           title: `War Sign-up #${st.warId}`,
           description:
@@ -344,13 +334,12 @@ client.on('interactionCreate', async (interaction) => {
             `React 👍 to **join** (timestamp recorded).\nReact 👎 if you **cannot** play.\nReact 🛑 to **cancel** this sign-up.`,
           footer: { text: `War #${st.warId}` }
         };
-        embed = embedWithWarId(embed, st.warId);
+        embed = ensureWarEmbed(embed, st.warId);
 
         const msg = await ch.send({ embeds: [embed] });
         warToMessage.set(String(st.warId), msg.id);
         pools.set(msg.id, { warId: st.warId, signups: new Map(), declines: new Map() });
 
-        // Log to Sheets
         pushWarCreated({
           warId: st.warId,
           opponent: st.opponent,
@@ -366,13 +355,64 @@ client.on('interactionCreate', async (interaction) => {
         await msg.react('🛑').catch(()=>{});
 
         await interaction.editReply({
-          content: `✅ Created **War Sign-up #${st.warId}** in <#${ch.id}>.\n${miniSummary(st)}`,
+          content: `✅ Created **War Sign-up #${st.warId}** in <#${ch.id}>.\n${summary(st)}`,
           components: [],
         });
 
-        wizard.delete(interaction.user.id);
+        state.delete(interaction.user.id);
         return;
       }
+    }
+
+    /* ---- Modals ---- */
+    if (interaction.isModalSubmit() && interaction.customId === 'wb:opp:modal') {
+      const st = state.get(interaction.user.id);
+      if (!st) return;
+      const opponent = interaction.fields.getTextInputValue('opp').trim();
+      const ready = canCreate({ ...st, opponent });
+
+      // Reply if original ephemeral is gone; usually we can edit.
+      const content =
+        `🧭 **War Setup** — **War ID ${st.warId}**\n${summary({ ...st, opponent })}`;
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({
+          content,
+          flags: 1 << 6,
+          components: [teamSizeMenu(st.teamSize), formatMenu(st.format), dateMenu(st.dateISO), timeMenu(st.timeValue), opponentButtons(!!opponent, ready)],
+        });
+      } else {
+        await interaction.editReply({
+          content,
+          components: [teamSizeMenu(st.teamSize), formatMenu(st.format), dateMenu(st.dateISO), timeMenu(st.timeValue), opponentButtons(!!opponent, ready)],
+        });
+      }
+      st.opponent = opponent;
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'wb:time:other') {
+      const st = state.get(interaction.user.id);
+      if (!st) return;
+      const txt = interaction.fields.getTextInputValue('othertime').trim();
+      st.timeValue = null;
+      st.timeLabel = txt;
+      if (st.dateLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
+      const ready = canCreate(st);
+
+      const content = `🧭 **War Setup** — **War ID ${st.warId}**\n${summary(st)}`;
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({
+          content,
+          flags: 1 << 6,
+          components: [teamSizeMenu(st.teamSize), formatMenu(st.format), dateMenu(st.dateISO), timeMenu(null), opponentButtons(!!st.opponent, ready)],
+        });
+      } else {
+        await interaction.editReply({
+          content,
+          components: [teamSizeMenu(st.teamSize), formatMenu(st.format), dateMenu(st.dateISO), timeMenu(null), opponentButtons(!!st.opponent, ready)],
+        });
+      }
+      return;
     }
 
   } catch (e) {
@@ -392,17 +432,14 @@ client.on('interactionCreate', async (interaction) => {
 /* ---------------- Reactions: 👍 / 👎 / 🛑 ---------------- */
 async function refreshSignupEmbed(msg, pool) {
   let base = msg.embeds[0]?.toJSON?.() || { title: `War Sign-up #${pool.warId}`, description: '' };
-  const yes = formatLines(pool.signups);
-  const no  = formatLines(pool.declines);
+  const yes = linesFrom(pool.signups);
+  const no  = linesFrom(pool.declines);
 
-  // Remove old sections if present
-  base.description = base.description
-    .replace(/\n?\*\*Joined \(.*?\)\*[\s\S]*/i, '')
-    .replace(/\n?\*\*Not participating \(.*?\)\*[\s\S]*/i, '');
-
+  // Clean old sections and re-append
+  base.description = base.description.replace(/\n?\*\*Joined \(.*?\)\*[\s\S]*/i, '').replace(/\n?\*\*Not participating \(.*?\)\*[\s\S]*/i, '');
   base.description += `\n\n**Joined (${pool.signups.size})**\n${yes}`;
   base.description += `\n\n**Not participating (${pool.declines.size})**\n${no}`;
-  base = embedWithWarId(base, pool.warId);
+  base = ensureWarEmbed(base, pool.warId);
   await msg.edit({ embeds: [base] }).catch(()=>{});
 }
 
@@ -464,7 +501,7 @@ client.on('messageReactionRemove', async (reaction, user) => {
 client.once('clientReady', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   await initSheets();
-  initDB(); // ok if no-op
+  initDB(); // fine if no-op
   await registerCommands();
 });
 client.login(process.env.DISCORD_TOKEN);
