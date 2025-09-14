@@ -1,5 +1,10 @@
-// index.js — Clean wizard (Team Size, Format, Opponent, Date(7 days ET), Time(4:30–11:30 PM ET + Other…))
-// Safe defers to avoid Unknown interaction; War ID visible; 👍/👎/🛑; Sheets logging; optional Render health server
+// index.js — fixed interaction flow to avoid "Unknown interaction" & "already acknowledged"
+// - Immediate reply for /warbot new (ephemeral), then edit
+// - DO NOT defer before showing modals
+// - Single deferUpdate for normal component updates
+// - War ID always visible
+// - 👍 join / 👎 opt-out / 🛑 cancel
+// Requires: sheets.js (initSheets, getNextWarId, pushWarCreated, pushResponse), db.js (initDB, no-op ok)
 
 process.on('unhandledRejection', (e) => console.error('UNHANDLED REJECTION:', e));
 process.on('uncaughtException', (e) => console.error('UNCAUGHT EXCEPTION:', e));
@@ -16,7 +21,7 @@ import {
 import { initSheets, getNextWarId, pushWarCreated, pushResponse } from './sheets.js';
 import { initDB } from './db.js';
 
-// ---------- Optional health server (Render Web Service). Safe to skip for Background Worker ----------
+/* ---------------- Optional health server (Render Web Service) ---------------- */
 const RENDER_PORT = Number(process.env.PORT);
 if (Number.isFinite(RENDER_PORT) && RENDER_PORT > 0) {
   const server = http.createServer((_, res) => {
@@ -29,7 +34,7 @@ if (Number.isFinite(RENDER_PORT) && RENDER_PORT > 0) {
   console.log('ℹ️ No PORT provided; skipping HTTP listener (OK for Background Worker).');
 }
 
-// ---------- In-memory state ----------
+/* ---------------- In-memory state ---------------- */
 /** wizardState[userId] = { warId, teamSize, format, opponent, dateISO, dateLabel, timeValue, timeLabel, startET } */
 const wizardState = new Map();
 /** pools[msgId] = { warId, signups: Map<userId,{name,tsMs}>, declines: Map<userId,{name,tsMs}> } */
@@ -37,7 +42,7 @@ const pools = new Map();
 /** warId -> messageId */
 const warToMessage = new Map();
 
-// ---------- Helpers ----------
+/* ---------------- Small helpers ---------------- */
 function embedWithWarId(base, warId) {
   const id = String(warId);
   const title = base.title && !/War Sign-up #/i.test(base.title) ? base.title : `War Sign-up #${id}`;
@@ -48,10 +53,9 @@ function embedWithWarId(base, warId) {
 
 function etDateAddDays(days) {
   const now = new Date();
-  const utc = now.getTime() + days * 86400000;
-  const d = new Date(utc);
-  // Set to ~noon ET to keep date stable across DST when formatting labels
-  d.setUTCHours(16, 0, 0, 0); // ~12:00 ET when ET = UTC-4
+  const d = new Date(now.getTime() + days * 86400000);
+  // set ~noon ET to stabilize label across DST differences
+  d.setUTCHours(16, 0, 0, 0);
   return d;
 }
 function etFormatDateLabel(d) {
@@ -61,7 +65,6 @@ function etFormatDateLabel(d) {
   });
 }
 function etFormatYYYYMMDD(d) {
-  // en-CA gives YYYY-MM-DD
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'
   }).format(d);
@@ -75,9 +78,9 @@ function buildDateChoices7() {
   return opts;
 }
 function buildTimeChoicesEvening() {
-  // 4:30 PM to 11:30 PM ET (every 30m)
+  // 4:30 PM to 11:30 PM ET, every 30 minutes
   const times = [];
-  let h = 16, m = 30; // 16:30
+  let h = 16, m = 30;
   while (h < 23 || (h === 23 && m <= 30)) {
     const label = new Date(Date.UTC(2000, 0, 1, h, m)).toLocaleTimeString('en-US', {
       hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
@@ -91,6 +94,7 @@ function buildTimeChoicesEvening() {
   return times;
 }
 
+/* ----- UI builders ----- */
 function dateMenu(selectedValue) {
   const opts = buildDateChoices7().map(o => ({ ...o, default: selectedValue === o.value }));
   return new ActionRowBuilder().addComponents(
@@ -106,7 +110,7 @@ function timeMenu(selectedValue) {
     new StringSelectMenuBuilder()
       .setCustomId('wb:w:clock')
       .setPlaceholder('Pick time (ET) — 4:30 PM to 11:30 PM')
-      .addOptions(...opts) // ~16 total incl. Other…
+      .addOptions(...opts) // ~16 inc. Other…
   );
 }
 function teamSizeMenu(selected) {
@@ -138,7 +142,12 @@ function navButtons(nextEnabled) {
     new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
   );
 }
-
+function createButtons(enabled) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success).setDisabled(!enabled),
+    new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
+}
 function formatLines(map) {
   const list = [...map.values()].sort((a, b) => a.tsMs - b.tsMs);
   if (!list.length) return '_none yet_';
@@ -151,7 +160,7 @@ function formatLines(map) {
   }).join('\n');
 }
 
-// ---------- Commands ----------
+/* ---------------- Commands ---------------- */
 async function registerCommands() {
   const cmds = [
     new SlashCommandBuilder()
@@ -170,7 +179,7 @@ async function registerCommands() {
   console.log('✅ Registered /warbot commands');
 }
 
-// ---------- Discord client ----------
+/* ---------------- Discord client ---------------- */
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -180,19 +189,24 @@ const client = new Client({
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
-// ---------- Interaction handlers ----------
+/* ---------------- Interaction handlers ---------------- */
 client.on('interactionCreate', async (interaction) => {
   try {
-    // /warbot (slash)
+    /* -------- Slash: /warbot -------- */
     if (interaction.isChatInputCommand() && interaction.commandName === 'warbot') {
       const sub = interaction.options.getSubcommand();
 
       if (sub === 'new') {
-        // Defer immediately (ephemeral) to avoid interaction timeout
-        await interaction.deferReply({ flags: 1 << 6 });
+        // 1) Reply immediately (ephemeral) — avoid "Unknown interaction"
+        await interaction.reply({
+          content: '⏳ Opening War Wizard…',
+          flags: 1 << 6, // ephemeral
+        });
 
-        // Prepare War ID
-        let warId = await getNextWarId().catch(() => null);
+        // 2) Compute War ID AFTER initial reply (network calls won’t cause timeout)
+        let warId;
+        try { warId = await getNextWarId(); }
+        catch { warId = null; }
         if (!Number.isInteger(warId)) {
           const n = new Date();
           warId = Number(`${n.getUTCFullYear()}${String(n.getUTCMonth()+1).padStart(2,'0')}${String(n.getUTCDate()).padStart(2,'0')}${String(n.getUTCHours()).padStart(2,'0')}${String(n.getUTCMinutes()).padStart(2,'0')}`);
@@ -215,7 +229,7 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (sub === 'cancel') {
-        await interaction.deferReply({ flags: 1 << 6 });
+        await interaction.reply({ content: '⏳ Cancelling…', flags: 1 << 6 });
         const warId = interaction.options.getInteger('war_id', true);
         const messageId = warToMessage.get(String(warId));
         if (!messageId) {
@@ -232,12 +246,26 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
-    // Wizard dropdowns
+    /* -------- Select Menus -------- */
     if (interaction.isStringSelectMenu()) {
       const st = wizardState.get(interaction.user.id);
       if (!st) return;
 
-      // acknowledge fast
+      // Special case: time == "other" -> MUST NOT ACK before showing modal
+      if (interaction.customId === 'wb:w:clock' && interaction.values[0] === 'other') {
+        const modal = new ModalBuilder().setCustomId('wb:w:othertime').setTitle('Custom Time (ET)');
+        const txt = new TextInputBuilder()
+          .setCustomId('wb:w:othertxt')
+          .setLabel('Enter time in ET (e.g., "1:05 AM" or "13:05")')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(40);
+        modal.addComponents(new ActionRowBuilder().addComponents(txt));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      // Normal selects: do a single deferUpdate, then editReply
       await interaction.deferUpdate();
 
       if (interaction.customId === 'wb:w:size') {
@@ -262,6 +290,7 @@ client.on('interactionCreate', async (interaction) => {
         st.dateISO = interaction.values[0];
         st.dateLabel = buildDateChoices7().find(o => o.value === st.dateISO)?.label || st.dateISO;
         if (st.timeLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
+        const canCreate = !!(st.opponent && st.dateISO && (st.timeValue || st.timeLabel));
         await interaction.editReply({
           content:
             `🧭 **War Wizard** — **War ID ${st.warId}**\n` +
@@ -269,33 +298,20 @@ client.on('interactionCreate', async (interaction) => {
             `Date (ET): **${st.dateLabel || '—'}**\n` +
             `Time (ET): **${st.timeLabel || '—'}**\n` +
             `Enter opponent and select both date & time, then **Create Sign-up**.`,
-          components: [
-            dateMenu(st.dateISO),
-            timeMenu(st.timeValue),
-            new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success)
-                .setDisabled(!(st.opponent && st.dateISO && (st.timeValue || st.timeLabel))),
-              new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
-            ),
-          ],
+          components: [dateMenu(st.dateISO), timeMenu(st.timeValue), createButtons(canCreate)],
         });
         return;
       }
 
       if (interaction.customId === 'wb:w:clock') {
         const val = interaction.values[0];
-        if (val === 'other') {
-          // Can't update here; we'll show a modal (separate request)
-          // No need to edit the message now.
-          return;
-        }
-        // Regular time from dropdown
         st.timeValue = val;
         const [H, M] = val.split(':').map(n => parseInt(n, 10));
         st.timeLabel = new Date(Date.UTC(2000, 0, 1, H, M)).toLocaleTimeString('en-US', {
           hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
         });
         if (st.dateLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
+        const canCreate = !!(st.opponent && st.dateISO && (st.timeValue || st.timeLabel));
         await interaction.editReply({
           content:
             `🧭 **War Wizard** — **War ID ${st.warId}**\n` +
@@ -303,39 +319,32 @@ client.on('interactionCreate', async (interaction) => {
             `Date (ET): **${st.dateLabel || '—'}**\n` +
             `Time (ET): **${st.timeLabel || '—'}**\n` +
             `Enter opponent and select both date & time, then **Create Sign-up**.`,
-          components: [
-            dateMenu(st.dateISO),
-            timeMenu(st.timeValue),
-            new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success)
-                .setDisabled(!(st.opponent && st.dateISO && (st.timeValue || st.timeLabel))),
-              new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
-            ),
-          ],
+          components: [dateMenu(st.dateISO), timeMenu(st.timeValue), createButtons(canCreate)],
         });
         return;
       }
     }
 
-    // Wizard buttons
+    /* -------- Buttons -------- */
     if (interaction.isButton()) {
       const st = wizardState.get(interaction.user.id);
 
-      // acknowledge fast
-      await interaction.deferUpdate();
-
       if (interaction.customId === 'wb:w:cancel') {
+        // Normal: we can deferUpdate then clear the wizard
+        await interaction.deferUpdate();
         wizardState.delete(interaction.user.id);
         await interaction.editReply({ content: '❌ Wizard cancelled.', components: [] });
         return;
       }
 
       if (interaction.customId === 'wb:w:next') {
+        // IMPORTANT: Do NOT defer before showModal
         if (!st || !st.teamSize || !st.format) {
-          await interaction.editReply({ content: 'Please choose team size and format first.', components: [teamSizeMenu(st?.teamSize), formatMenu(st?.format), navButtons(!!(st?.teamSize && st?.format))] });
+          // we haven’t acknowledged; do a minimal update path
+          // fallback: reply/update depends on context, but we can just ignore and ask to select
+          await interaction.reply({ content: 'Please choose team size and format first.', flags: 1 << 6 }).catch(()=>{});
           return;
         }
-        // Show opponent modal
         const modal = new ModalBuilder().setCustomId('wb:w:oppmodal').setTitle('Enter Opponent');
         const opp = new TextInputBuilder()
           .setCustomId('wb:w:opptxt')
@@ -349,6 +358,8 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (interaction.customId === 'wb:w:create') {
+        // Normal button → deferUpdate then finalize
+        await interaction.deferUpdate();
         if (!st || !st.opponent || !st.dateISO || !(st.timeValue || st.timeLabel)) {
           await interaction.editReply({ content: 'Please enter opponent and pick both date & time.', components: [] });
           return;
@@ -407,7 +418,7 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
-    // Opponent modal submit
+    /* -------- Modal submits -------- */
     if (interaction.isModalSubmit() && interaction.customId === 'wb:w:oppmodal') {
       const st = wizardState.get(interaction.user.id);
       if (!st) return;
@@ -415,25 +426,18 @@ client.on('interactionCreate', async (interaction) => {
       const opponent = interaction.fields.getTextInputValue('wb:w:opptxt').trim();
       st.opponent = opponent;
 
+      // We already replied for the slash command; just edit that reply (no defers needed for modals)
+      const canCreate = !!(st.opponent && st.dateISO && (st.timeValue || st.timeLabel));
       await interaction.editReply({
         content:
           `🧭 **War Wizard** — **War ID ${st.warId}**\n` +
           `Opponent: **${st.opponent}**\n` +
           `Pick **Date** and **Time (ET)** below, then **Create Sign-up**.`,
-        components: [
-          dateMenu(st.dateISO),
-          timeMenu(st.timeValue),
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success)
-              .setDisabled(!(st.opponent && st.dateISO && (st.timeValue || st.timeLabel))),
-            new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
-          ),
-        ],
+        components: [dateMenu(st.dateISO), timeMenu(st.timeValue), createButtons(canCreate)],
       });
       return;
     }
 
-    // Custom time modal (Other…)
     if (interaction.isModalSubmit() && interaction.customId === 'wb:w:othertime') {
       const st = wizardState.get(interaction.user.id);
       if (!st) return;
@@ -442,7 +446,7 @@ client.on('interactionCreate', async (interaction) => {
       st.timeValue = null;
       st.timeLabel = txt;
       if (st.dateLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
-
+      const canCreate = !!(st.opponent && st.dateISO && (st.timeValue || st.timeLabel));
       await interaction.editReply({
         content:
           `🧭 **War Wizard** — **War ID ${st.warId}**\n` +
@@ -450,35 +454,10 @@ client.on('interactionCreate', async (interaction) => {
           `Date (ET): **${st.dateLabel || '—'}**\n` +
           `Time (ET): **${st.timeLabel || '—'}**\n` +
           `Select both date & time, then **Create Sign-up**.`,
-        components: [
-          dateMenu(st.dateISO),
-          timeMenu(null),
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success)
-              .setDisabled(!(st.opponent && st.dateISO && (st.timeLabel || st.timeValue))),
-            new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
-          ),
-        ],
+        components: [dateMenu(st.dateISO), timeMenu(null), createButtons(canCreate)],
       });
       return;
     }
-
-    // Open the "Other..." custom time modal when selected
-    if (interaction.isStringSelectMenu() && interaction.customId === 'wb:w:clock' && interaction.values[0] === 'other') {
-      // Don't deferUpdate again here (it was already deferred above),
-      // just show a modal, Discord allows this.
-      const modal = new ModalBuilder().setCustomId('wb:w:othertime').setTitle('Custom Time (ET)');
-      const txt = new TextInputBuilder()
-        .setCustomId('wb:w:othertxt')
-        .setLabel('Enter time in ET (e.g., "1:05 AM" or "13:05")')
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setMaxLength(40);
-      modal.addComponents(new ActionRowBuilder().addComponents(txt));
-      await interaction.showModal(modal);
-      return;
-    }
-
   } catch (e) {
     console.error('INTERACTION ERROR:', e);
     try {
@@ -493,13 +472,12 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// ---------- Reactions: 👍 join / 👎 opt-out / 🛑 cancel ----------
+/* ---------------- Reactions: 👍 join / 👎 opt-out / 🛑 cancel ---------------- */
 async function updateSignupEmbed(msg, pool) {
   let base = msg.embeds[0]?.toJSON?.() || { title: `War Sign-up #${pool.warId}`, description: '' };
   const yesLines = formatLines(pool.signups);
   const noLines  = formatLines(pool.declines);
 
-  // Remove previous sections if present, then append fresh lists
   base.description = base.description
     .replace(/\n?\*\*Joined.*$/s, '')
     .replace(/\n?\*\*Not participating.*$/s, '');
@@ -514,8 +492,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
   try {
     if (user.bot) return;
     const msg = reaction.message;
-    if (!msg?.id) return;
-    const pool = pools.get(msg.id);
+    const pool = msg?.id ? pools.get(msg.id) : null;
     if (!pool) return;
 
     const name = user.username;
@@ -549,8 +526,7 @@ client.on('messageReactionRemove', async (reaction, user) => {
   try {
     if (user.bot) return;
     const msg = reaction.message;
-    if (!msg?.id) return;
-    const pool = pools.get(msg.id);
+    const pool = msg?.id ? pools.get(msg.id) : null;
     if (!pool) return;
 
     if (reaction.emoji.name === '👍') {
@@ -566,12 +542,11 @@ client.on('messageReactionRemove', async (reaction, user) => {
   }
 });
 
-// ---------- Startup ----------
+/* ---------------- Startup ---------------- */
 client.once('clientReady', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   await initSheets();
-  initDB(); // no-op for now
+  initDB(); // fine if no-op
   await registerCommands();
 });
-
 client.login(process.env.DISCORD_TOKEN);
