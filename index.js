@@ -1,5 +1,5 @@
-// index.js — Date+Time wizard (7-day date dropdown + 4:30–11:30 PM ET time dropdown + “Other…” modal)
-// Includes: War ID, 👍 join, 👎 opt-out, 🛑 cancel, Sheets logging, safe replies, Render health server.
+// index.js — Clean wizard (Team Size, Format, Opponent, Date(7 days ET), Time(4:30–11:30 PM ET + Other…))
+// Safe defers to avoid Unknown interaction; War ID visible; 👍/👎/🛑; Sheets logging; optional Render health server
 
 process.on('unhandledRejection', (e) => console.error('UNHANDLED REJECTION:', e));
 process.on('uncaughtException', (e) => console.error('UNCAUGHT EXCEPTION:', e));
@@ -16,7 +16,7 @@ import {
 import { initSheets, getNextWarId, pushWarCreated, pushResponse } from './sheets.js';
 import { initDB } from './db.js';
 
-// ---------- Render health (only if PORT is set) ----------
+// ---------- Optional health server (Render Web Service). Safe to skip for Background Worker ----------
 const RENDER_PORT = Number(process.env.PORT);
 if (Number.isFinite(RENDER_PORT) && RENDER_PORT > 0) {
   const server = http.createServer((_, res) => {
@@ -29,7 +29,7 @@ if (Number.isFinite(RENDER_PORT) && RENDER_PORT > 0) {
   console.log('ℹ️ No PORT provided; skipping HTTP listener (OK for Background Worker).');
 }
 
-// ---------- State ----------
+// ---------- In-memory state ----------
 /** wizardState[userId] = { warId, teamSize, format, opponent, dateISO, dateLabel, timeValue, timeLabel, startET } */
 const wizardState = new Map();
 /** pools[msgId] = { warId, signups: Map<userId,{name,tsMs}>, declines: Map<userId,{name,tsMs}> } */
@@ -47,22 +47,24 @@ function embedWithWarId(base, warId) {
 }
 
 function etDateAddDays(days) {
-  // Build a Date representing "today in ET" + days, at noon ET to avoid DST edge cases during format.
   const now = new Date();
-  const utc = now.getTime() + (days * 24 * 60 * 60 * 1000);
+  const utc = now.getTime() + days * 86400000;
   const d = new Date(utc);
-  // We'll format using ET and only need labels and YYYY-MM-DD strings; noon choice avoids DST traps.
-  d.setUTCHours(16, 0, 0, 0); // ~noon ET (16:00 UTC when ET=UTC-4)
+  // Set to ~noon ET to keep date stable across DST when formatting labels
+  d.setUTCHours(16, 0, 0, 0); // ~12:00 ET when ET = UTC-4
   return d;
 }
 function etFormatDateLabel(d) {
-  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/New_York' });
+  return d.toLocaleDateString('en-US', {
+    weekday: 'short', month: 'short', day: 'numeric',
+    timeZone: 'America/New_York',
+  });
 }
 function etFormatYYYYMMDD(d) {
-  // Get YYYY-MM-DD for ET calendar date
-  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
-  // en-CA gives YYYY-MM-DD already
-  return parts;
+  // en-CA gives YYYY-MM-DD
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'
+  }).format(d);
 }
 function buildDateChoices7() {
   const opts = [];
@@ -73,38 +75,38 @@ function buildDateChoices7() {
   return opts;
 }
 function buildTimeChoicesEvening() {
-  // 4:30 PM to 11:30 PM ET, every 30 minutes
+  // 4:30 PM to 11:30 PM ET (every 30m)
   const times = [];
   let h = 16, m = 30; // 16:30
   while (h < 23 || (h === 23 && m <= 30)) {
     const label = new Date(Date.UTC(2000, 0, 1, h, m)).toLocaleTimeString('en-US', {
       hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
     });
-    const val = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`; // 24h "HH:MM"
+    const val = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
     times.push({ label, value: val });
     m += 30;
     if (m >= 60) { m = 0; h += 1; }
   }
-  // Add an "Other…" item to allow manual times outside the band
   times.push({ label: 'Other…', value: 'other' });
   return times;
 }
+
 function dateMenu(selectedValue) {
-  const opts = buildDateChoices7().map(({ label, value }) => ({ label, value, default: selectedValue === value }));
+  const opts = buildDateChoices7().map(o => ({ ...o, default: selectedValue === o.value }));
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId('wb:w:date')
       .setPlaceholder('Pick date (ET) — next 7 days')
-      .addOptions(...opts) // ≤ 7
+      .addOptions(...opts) // ≤7
   );
 }
 function timeMenu(selectedValue) {
-  const opts = buildTimeChoicesEvening().map(({ label, value }) => ({ label, value, default: selectedValue === value }));
+  const opts = buildTimeChoicesEvening().map(o => ({ ...o, default: selectedValue === o.value }));
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId('wb:w:clock')
       .setPlaceholder('Pick time (ET) — 4:30 PM to 11:30 PM')
-      .addOptions(...opts) // 15 + 1 ("Other…") ≤ 25
+      .addOptions(...opts) // ~16 total incl. Other…
   );
 }
 function teamSizeMenu(selected) {
@@ -137,7 +139,6 @@ function navButtons(nextEnabled) {
   );
 }
 
-// pretty list for embed updates
 function formatLines(map) {
   const list = [...map.values()].sort((a, b) => a.tsMs - b.tsMs);
   if (!list.length) return '_none yet_';
@@ -148,19 +149,6 @@ function formatLines(map) {
     });
     return `${v.name} (${dt} ET)`;
   }).join('\n');
-}
-
-// Safe ephemeral responder (avoids “Unknown interaction”)
-async function safeEphemeral(interaction, content) {
-  try {
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp?.({ content, flags: 1 << 6 });
-    } else {
-      await interaction.reply({ content, flags: 1 << 6 });
-    }
-  } catch (e) {
-    console.error('safeEphemeral error:', e);
-  }
 }
 
 // ---------- Commands ----------
@@ -192,77 +180,89 @@ const client = new Client({
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
+// ---------- Interaction handlers ----------
 client.on('interactionCreate', async (interaction) => {
   try {
-    // --- slash commands
+    // /warbot (slash)
     if (interaction.isChatInputCommand() && interaction.commandName === 'warbot') {
       const sub = interaction.options.getSubcommand();
 
       if (sub === 'new') {
-        // New War ID from Sheets; fallback to timestamp if Sheets hiccups
+        // Defer immediately (ephemeral) to avoid interaction timeout
+        await interaction.deferReply({ flags: 1 << 6 });
+
+        // Prepare War ID
         let warId = await getNextWarId().catch(() => null);
         if (!Number.isInteger(warId)) {
           const n = new Date();
           warId = Number(`${n.getUTCFullYear()}${String(n.getUTCMonth()+1).padStart(2,'0')}${String(n.getUTCDate()).padStart(2,'0')}${String(n.getUTCHours()).padStart(2,'0')}${String(n.getUTCMinutes()).padStart(2,'0')}`);
         }
+
         wizardState.set(interaction.user.id, {
           warId, teamSize: null, format: null, opponent: null,
-          dateISO: null, dateLabel: null,
-          timeValue: null, timeLabel: null, startET: null
+          dateISO: null, dateLabel: null, timeValue: null, timeLabel: null, startET: null
         });
 
-        await interaction.reply({
+        await interaction.editReply({
           content:
             `🧭 **War Wizard** — **War ID ${warId}**\n` +
-            `1) Choose **Team Size**\n2) Choose **Format**\n3) Enter **Opponent** & pick **Date** and **Time**\n\n` +
-            `Your selections will remain visible below.`,
+            `1) Choose **Team Size**\n2) Choose **Format**\n3) Click **Next** to enter **Opponent**\n` +
+            `4) Pick **Date** & **Time (ET)**, then **Create Sign-up**.\n\n` +
+            `Your selections will stay visible here.`,
           components: [teamSizeMenu(null), formatMenu(null), navButtons(false)],
-          flags: 1 << 6, // ephemeral
         });
         return;
       }
 
       if (sub === 'cancel') {
+        await interaction.deferReply({ flags: 1 << 6 });
         const warId = interaction.options.getInteger('war_id', true);
         const messageId = warToMessage.get(String(warId));
-        if (!messageId) return safeEphemeral(interaction, `❌ I can’t find a live sign-up for War ID ${warId}.`);
-
+        if (!messageId) {
+          await interaction.editReply(`❌ I can’t find a live sign-up for War ID ${warId}.`);
+          return;
+        }
         const ch = await client.channels.fetch(process.env.WAR_CHANNEL_ID).catch(()=>null);
         const msg = ch ? await ch.messages.fetch(messageId).catch(()=>null) : null;
         if (msg) await msg.delete().catch(()=>{});
         warToMessage.delete(String(warId));
         for (const [mid] of pools) if (mid === messageId) pools.delete(mid);
-        return safeEphemeral(interaction, `🛑 War Sign-up #${warId} has been cancelled.`);
+        await interaction.editReply(`🛑 War Sign-up #${warId} has been cancelled.`);
+        return;
       }
     }
 
-    // --- wizard dropdowns
+    // Wizard dropdowns
     if (interaction.isStringSelectMenu()) {
       const st = wizardState.get(interaction.user.id);
       if (!st) return;
 
+      // acknowledge fast
+      await interaction.deferUpdate();
+
       if (interaction.customId === 'wb:w:size') {
         st.teamSize = interaction.values[0];
-        return interaction.update({
+        await interaction.editReply({
           content: `🧭 **War Wizard** — **War ID ${st.warId}**\nTeam Size: **${st.teamSize || '—'}** | Format: **${st.format || '—'}**\nSelect both, then click **Next**.`,
           components: [teamSizeMenu(st.teamSize), formatMenu(st.format), navButtons(!!(st.teamSize && st.format))],
         });
+        return;
       }
 
       if (interaction.customId === 'wb:w:format') {
         st.format = interaction.values[0];
-        return interaction.update({
+        await interaction.editReply({
           content: `🧭 **War Wizard** — **War ID ${st.warId}**\nTeam Size: **${st.teamSize || '—'}** | Format: **${st.format || '—'}**\nSelect both, then click **Next**.`,
           components: [teamSizeMenu(st.teamSize), formatMenu(st.format), navButtons(!!(st.teamSize && st.format))],
         });
+        return;
       }
 
       if (interaction.customId === 'wb:w:date') {
-        st.dateISO = interaction.values[0]; // YYYY-MM-DD (ET)
+        st.dateISO = interaction.values[0];
         st.dateLabel = buildDateChoices7().find(o => o.value === st.dateISO)?.label || st.dateISO;
-        // If time already chosen, compose startET
         if (st.timeLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
-        return interaction.update({
+        await interaction.editReply({
           content:
             `🧭 **War Wizard** — **War ID ${st.warId}**\n` +
             `Opponent: **${st.opponent || '—'}**\n` +
@@ -274,39 +274,29 @@ client.on('interactionCreate', async (interaction) => {
             timeMenu(st.timeValue),
             new ActionRowBuilder().addComponents(
               new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success)
-                .setDisabled(!(st.opponent && st.dateISO && (st.timeValue || st.startET))),
+                .setDisabled(!(st.opponent && st.dateISO && (st.timeValue || st.timeLabel))),
               new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
             ),
           ],
         });
+        return;
       }
 
       if (interaction.customId === 'wb:w:clock') {
         const val = interaction.values[0];
         if (val === 'other') {
-          // Open modal for custom time (ET)
-          const modal = new ModalBuilder().setCustomId('wb:w:othertime').setTitle('Custom Time (ET)');
-          const txt = new TextInputBuilder()
-            .setCustomId('wb:w:othertxt')
-            .setLabel('Enter time in ET (e.g., "1:05 AM" or "13:05")')
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setMaxLength(40);
-          modal.addComponents(new ActionRowBuilder().addComponents(txt));
-          await interaction.showModal(modal);
+          // Can't update here; we'll show a modal (separate request)
+          // No need to edit the message now.
           return;
         }
-        // Regular band time
-        st.timeValue = val; // "HH:MM" 24h ET
-        // Turn label into 12-hour formatted display
+        // Regular time from dropdown
+        st.timeValue = val;
         const [H, M] = val.split(':').map(n => parseInt(n, 10));
-        const label = new Date(Date.UTC(2000, 0, 1, H, M)).toLocaleTimeString('en-US', {
+        st.timeLabel = new Date(Date.UTC(2000, 0, 1, H, M)).toLocaleTimeString('en-US', {
           hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
         });
-        st.timeLabel = label;
         if (st.dateLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
-
-        return interaction.update({
+        await interaction.editReply({
           content:
             `🧭 **War Wizard** — **War ID ${st.warId}**\n` +
             `Opponent: **${st.opponent || '—'}**\n` +
@@ -318,25 +308,34 @@ client.on('interactionCreate', async (interaction) => {
             timeMenu(st.timeValue),
             new ActionRowBuilder().addComponents(
               new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success)
-                .setDisabled(!(st.opponent && st.dateISO && (st.timeValue || st.startET))),
+                .setDisabled(!(st.opponent && st.dateISO && (st.timeValue || st.timeLabel))),
               new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
             ),
           ],
         });
+        return;
       }
     }
 
-    // --- wizard buttons & modal
+    // Wizard buttons
     if (interaction.isButton()) {
       const st = wizardState.get(interaction.user.id);
 
+      // acknowledge fast
+      await interaction.deferUpdate();
+
       if (interaction.customId === 'wb:w:cancel') {
         wizardState.delete(interaction.user.id);
-        return interaction.update({ content: '❌ Wizard cancelled.', components: [] });
+        await interaction.editReply({ content: '❌ Wizard cancelled.', components: [] });
+        return;
       }
 
       if (interaction.customId === 'wb:w:next') {
-        if (!st || !st.teamSize || !st.format) return safeEphemeral(interaction, 'Please choose team size and format first.');
+        if (!st || !st.teamSize || !st.format) {
+          await interaction.editReply({ content: 'Please choose team size and format first.', components: [teamSizeMenu(st?.teamSize), formatMenu(st?.format), navButtons(!!(st?.teamSize && st?.format))] });
+          return;
+        }
+        // Show opponent modal
         const modal = new ModalBuilder().setCustomId('wb:w:oppmodal').setTitle('Enter Opponent');
         const opp = new TextInputBuilder()
           .setCustomId('wb:w:opptxt')
@@ -350,12 +349,17 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (interaction.customId === 'wb:w:create') {
-        if (!st || !st.opponent || !st.dateISO || !(st.timeValue || st.startET)) {
-          return safeEphemeral(interaction, 'Please enter opponent and pick both date & time.');
+        if (!st || !st.opponent || !st.dateISO || !(st.timeValue || st.timeLabel)) {
+          await interaction.editReply({ content: 'Please enter opponent and pick both date & time.', components: [] });
+          return;
         }
+
         const chId = process.env.WAR_CHANNEL_ID;
         const ch = chId ? await client.channels.fetch(chId).catch(()=>null) : null;
-        if (!ch || !ch.isTextBased()) return safeEphemeral(interaction, '❌ WAR_CHANNEL_ID is missing or invalid.');
+        if (!ch || !ch.isTextBased()) {
+          await interaction.editReply('❌ WAR_CHANNEL_ID is missing or invalid.');
+          return;
+        }
 
         const startText = st.startET || `${st.dateLabel}, ${st.timeLabel} ET`;
 
@@ -376,7 +380,7 @@ client.on('interactionCreate', async (interaction) => {
         warToMessage.set(String(st.warId), msg.id);
         pools.set(msg.id, { warId: st.warId, signups: new Map(), declines: new Map() });
 
-        // Sheets log
+        // Log to Sheets
         pushWarCreated({
           warId: st.warId,
           opponent: st.opponent,
@@ -391,13 +395,15 @@ client.on('interactionCreate', async (interaction) => {
         await msg.react('👎').catch(()=>{});
         await msg.react('🛑').catch(()=>{});
 
-        wizardState.delete(interaction.user.id);
-        return interaction.update({
+        await interaction.editReply({
           content:
             `✅ **War Sign-up #${st.warId}** created in <#${ch.id}>.\n` +
             `Opponent: **${st.opponent}** | Format: **${st.format}** | Team: **${st.teamSize}v${st.teamSize}** | Start: **${startText}**`,
           components: [],
         });
+
+        wizardState.delete(interaction.user.id);
+        return;
       }
     }
 
@@ -405,8 +411,11 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isModalSubmit() && interaction.customId === 'wb:w:oppmodal') {
       const st = wizardState.get(interaction.user.id);
       if (!st) return;
-      st.opponent = interaction.fields.getTextInputValue('wb:w:opptxt');
-      return interaction.reply({
+
+      const opponent = interaction.fields.getTextInputValue('wb:w:opptxt').trim();
+      st.opponent = opponent;
+
+      await interaction.editReply({
         content:
           `🧭 **War Wizard** — **War ID ${st.warId}**\n` +
           `Opponent: **${st.opponent}**\n` +
@@ -416,24 +425,25 @@ client.on('interactionCreate', async (interaction) => {
           timeMenu(st.timeValue),
           new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success)
-              .setDisabled(!(st.opponent && st.dateISO && (st.timeValue || st.startET))),
+              .setDisabled(!(st.opponent && st.dateISO && (st.timeValue || st.timeLabel))),
             new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
           ),
         ],
-        flags: 1 << 6,
       });
+      return;
     }
 
     // Custom time modal (Other…)
     if (interaction.isModalSubmit() && interaction.customId === 'wb:w:othertime') {
       const st = wizardState.get(interaction.user.id);
       if (!st) return;
+
       const txt = interaction.fields.getTextInputValue('wb:w:othertxt').trim();
-      // Store as-is; user provided ET time. We’ll display with date if present.
-      st.timeValue = null; // not from dropdown
+      st.timeValue = null;
       st.timeLabel = txt;
       if (st.dateLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
-      await interaction.reply({
+
+      await interaction.editReply({
         content:
           `🧭 **War Wizard** — **War ID ${st.warId}**\n` +
           `Opponent: **${st.opponent || '—'}**\n` +
@@ -449,8 +459,24 @@ client.on('interactionCreate', async (interaction) => {
             new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
           ),
         ],
-        flags: 1 << 6,
       });
+      return;
+    }
+
+    // Open the "Other..." custom time modal when selected
+    if (interaction.isStringSelectMenu() && interaction.customId === 'wb:w:clock' && interaction.values[0] === 'other') {
+      // Don't deferUpdate again here (it was already deferred above),
+      // just show a modal, Discord allows this.
+      const modal = new ModalBuilder().setCustomId('wb:w:othertime').setTitle('Custom Time (ET)');
+      const txt = new TextInputBuilder()
+        .setCustomId('wb:w:othertxt')
+        .setLabel('Enter time in ET (e.g., "1:05 AM" or "13:05")')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(40);
+      modal.addComponents(new ActionRowBuilder().addComponents(txt));
+      await interaction.showModal(modal);
+      return;
     }
 
   } catch (e) {
@@ -473,6 +499,7 @@ async function updateSignupEmbed(msg, pool) {
   const yesLines = formatLines(pool.signups);
   const noLines  = formatLines(pool.declines);
 
+  // Remove previous sections if present, then append fresh lists
   base.description = base.description
     .replace(/\n?\*\*Joined.*$/s, '')
     .replace(/\n?\*\*Not participating.*$/s, '');
@@ -543,7 +570,7 @@ client.on('messageReactionRemove', async (reaction, user) => {
 client.once('clientReady', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   await initSheets();
-  initDB(); // no-op
+  initDB(); // no-op for now
   await registerCommands();
 });
 
