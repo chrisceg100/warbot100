@@ -1,4 +1,5 @@
-// index.js — Fresh minimal build with Paged Time Picker (24 options/page) + War ID + 👍/👎/🛑 + Sheets
+// index.js — Date+Time wizard (7-day date dropdown + 4:30–11:30 PM ET time dropdown + “Other…” modal)
+// Includes: War ID, 👍 join, 👎 opt-out, 🛑 cancel, Sheets logging, safe replies, Render health server.
 
 process.on('unhandledRejection', (e) => console.error('UNHANDLED REJECTION:', e));
 process.on('uncaughtException', (e) => console.error('UNCAUGHT EXCEPTION:', e));
@@ -15,7 +16,7 @@ import {
 import { initSheets, getNextWarId, pushWarCreated, pushResponse } from './sheets.js';
 import { initDB } from './db.js';
 
-// ---------- Render compatibility: bind only if PORT is provided ----------
+// ---------- Render health (only if PORT is set) ----------
 const RENDER_PORT = Number(process.env.PORT);
 if (Number.isFinite(RENDER_PORT) && RENDER_PORT > 0) {
   const server = http.createServer((_, res) => {
@@ -28,10 +29,10 @@ if (Number.isFinite(RENDER_PORT) && RENDER_PORT > 0) {
   console.log('ℹ️ No PORT provided; skipping HTTP listener (OK for Background Worker).');
 }
 
-// ---------- In-memory state ----------
-/** wizardState[userId] = { warId, teamSize, format, opponent, startET, timePage } */
+// ---------- State ----------
+/** wizardState[userId] = { warId, teamSize, format, opponent, dateISO, dateLabel, timeValue, timeLabel, startET } */
 const wizardState = new Map();
-/** pools[msgId] = { warId, signups: Map<userId, {name, tsMs}>, declines: Map<userId, {name, tsMs}> } */
+/** pools[msgId] = { warId, signups: Map<userId,{name,tsMs}>, declines: Map<userId,{name,tsMs}> } */
 const pools = new Map();
 /** warId -> messageId */
 const warToMessage = new Map();
@@ -45,40 +46,67 @@ function embedWithWarId(base, warId) {
   return { ...base, title, description: ensured, footer: { text: `War #${id}` } };
 }
 
-function nextHalfHourET() {
+function etDateAddDays(days) {
+  // Build a Date representing "today in ET" + days, at noon ET to avoid DST edge cases during format.
   const now = new Date();
-  // round up to next :00 or :30 in *UTC time*, we'll format in ET for display
-  const d = new Date(now.getTime());
-  const m = d.getMinutes();
-  d.setMinutes(m < 30 ? 30 : 60, 0, 0);
+  const utc = now.getTime() + (days * 24 * 60 * 60 * 1000);
+  const d = new Date(utc);
+  // We'll format using ET and only need labels and YYYY-MM-DD strings; noon choice avoids DST traps.
+  d.setUTCHours(16, 0, 0, 0); // ~noon ET (16:00 UTC when ET=UTC-4)
   return d;
 }
-
-function slotLabelET(date) {
-  return date.toLocaleString('en-US', {
-    weekday: 'short', month: 'numeric', day: 'numeric',
-    hour: 'numeric', minute: '2-digit', hour12: true,
-    timeZone: 'America/New_York',
-  }) + ' ET';
+function etFormatDateLabel(d) {
+  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/New_York' });
 }
-
-/**
- * Build 24 half-hour slots for a given page.
- * page 0 = next 12 hours, page 1 = hours 12–24, ... up to page 5 (total 72h).
- */
-function buildTimeChoicesPage(page = 0) {
-  const out = [];
-  const start = nextHalfHourET();
-  const pageStart = new Date(start.getTime() + page * 12 * 60 * 60 * 1000); // + N * 12h
-  for (let i = 0; i < 24; i++) {
-    const t = new Date(pageStart.getTime() + i * 30 * 60 * 1000);
-    const label = slotLabelET(t);
-    out.push({ label, value: String(t.getTime()) }); // store ms since epoch as value
+function etFormatYYYYMMDD(d) {
+  // Get YYYY-MM-DD for ET calendar date
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+  // en-CA gives YYYY-MM-DD already
+  return parts;
+}
+function buildDateChoices7() {
+  const opts = [];
+  for (let i = 0; i < 7; i++) {
+    const d = etDateAddDays(i);
+    opts.push({ label: etFormatDateLabel(d), value: etFormatYYYYMMDD(d) });
   }
-  return out;
+  return opts;
 }
-
-// sticky components
+function buildTimeChoicesEvening() {
+  // 4:30 PM to 11:30 PM ET, every 30 minutes
+  const times = [];
+  let h = 16, m = 30; // 16:30
+  while (h < 23 || (h === 23 && m <= 30)) {
+    const label = new Date(Date.UTC(2000, 0, 1, h, m)).toLocaleTimeString('en-US', {
+      hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
+    });
+    const val = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`; // 24h "HH:MM"
+    times.push({ label, value: val });
+    m += 30;
+    if (m >= 60) { m = 0; h += 1; }
+  }
+  // Add an "Other…" item to allow manual times outside the band
+  times.push({ label: 'Other…', value: 'other' });
+  return times;
+}
+function dateMenu(selectedValue) {
+  const opts = buildDateChoices7().map(({ label, value }) => ({ label, value, default: selectedValue === value }));
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('wb:w:date')
+      .setPlaceholder('Pick date (ET) — next 7 days')
+      .addOptions(...opts) // ≤ 7
+  );
+}
+function timeMenu(selectedValue) {
+  const opts = buildTimeChoicesEvening().map(({ label, value }) => ({ label, value, default: selectedValue === value }));
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('wb:w:clock')
+      .setPlaceholder('Pick time (ET) — 4:30 PM to 11:30 PM')
+      .addOptions(...opts) // 15 + 1 ("Other…") ≤ 25
+  );
+}
 function teamSizeMenu(selected) {
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
@@ -102,23 +130,6 @@ function formatMenu(selected) {
       )
   );
 }
-function timeMenu(page = 0, selectedValue = null) {
-  const opts = buildTimeChoicesPage(page).map(({ label, value }) => ({
-    label, value, default: selectedValue === value
-  }));
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('wb:w:time')
-      .setPlaceholder(`Pick a start time (ET) — Page ${page + 1}/6`)
-      .addOptions(...opts)
-  );
-}
-function timePager(page = 0) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('wb:w:tprev').setLabel('◀ Prev 12h').setStyle(ButtonStyle.Secondary).setDisabled(page <= 0),
-    new ButtonBuilder().setCustomId('wb:w:tnext').setLabel('Next 12h ▶').setStyle(ButtonStyle.Secondary).setDisabled(page >= 5),
-  );
-}
 function navButtons(nextEnabled) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('wb:w:next').setLabel('Next').setStyle(ButtonStyle.Primary).setDisabled(!nextEnabled),
@@ -126,7 +137,7 @@ function navButtons(nextEnabled) {
   );
 }
 
-// pretty list
+// pretty list for embed updates
 function formatLines(map) {
   const list = [...map.values()].sort((a, b) => a.tsMs - b.tsMs);
   if (!list.length) return '_none yet_';
@@ -137,6 +148,19 @@ function formatLines(map) {
     });
     return `${v.name} (${dt} ET)`;
   }).join('\n');
+}
+
+// Safe ephemeral responder (avoids “Unknown interaction”)
+async function safeEphemeral(interaction, content) {
+  try {
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp?.({ content, flags: 1 << 6 });
+    } else {
+      await interaction.reply({ content, flags: 1 << 6 });
+    }
+  } catch (e) {
+    console.error('safeEphemeral error:', e);
+  }
 }
 
 // ---------- Commands ----------
@@ -175,18 +199,22 @@ client.on('interactionCreate', async (interaction) => {
       const sub = interaction.options.getSubcommand();
 
       if (sub === 'new') {
-        // 1) get a War ID
+        // New War ID from Sheets; fallback to timestamp if Sheets hiccups
         let warId = await getNextWarId().catch(() => null);
         if (!Number.isInteger(warId)) {
           const n = new Date();
           warId = Number(`${n.getUTCFullYear()}${String(n.getUTCMonth()+1).padStart(2,'0')}${String(n.getUTCDate()).padStart(2,'0')}${String(n.getUTCHours()).padStart(2,'0')}${String(n.getUTCMinutes()).padStart(2,'0')}`);
         }
-        wizardState.set(interaction.user.id, { warId, teamSize: null, format: null, opponent: null, startET: null, timePage: 0 });
+        wizardState.set(interaction.user.id, {
+          warId, teamSize: null, format: null, opponent: null,
+          dateISO: null, dateLabel: null,
+          timeValue: null, timeLabel: null, startET: null
+        });
 
         await interaction.reply({
           content:
             `🧭 **War Wizard** — **War ID ${warId}**\n` +
-            `1) Choose **Team Size**\n2) Choose **Format**\n3) Enter **Opponent** & **Start Time**\n\n` +
+            `1) Choose **Team Size**\n2) Choose **Format**\n3) Enter **Opponent** & pick **Date** and **Time**\n\n` +
             `Your selections will remain visible below.`,
           components: [teamSizeMenu(null), formatMenu(null), navButtons(false)],
           flags: 1 << 6, // ephemeral
@@ -197,17 +225,14 @@ client.on('interactionCreate', async (interaction) => {
       if (sub === 'cancel') {
         const warId = interaction.options.getInteger('war_id', true);
         const messageId = warToMessage.get(String(warId));
-        if (!messageId) {
-          await interaction.reply({ content: `❌ I can’t find a live sign-up for War ID ${warId}.`, flags: 1 << 6 });
-          return;
-        }
+        if (!messageId) return safeEphemeral(interaction, `❌ I can’t find a live sign-up for War ID ${warId}.`);
+
         const ch = await client.channels.fetch(process.env.WAR_CHANNEL_ID).catch(()=>null);
         const msg = ch ? await ch.messages.fetch(messageId).catch(()=>null) : null;
         if (msg) await msg.delete().catch(()=>{});
         warToMessage.delete(String(warId));
         for (const [mid] of pools) if (mid === messageId) pools.delete(mid);
-        await interaction.reply({ content: `🛑 War Sign-up #${warId} has been cancelled.`, flags: 1 << 6 });
-        return;
+        return safeEphemeral(interaction, `🛑 War Sign-up #${warId} has been cancelled.`);
       }
     }
 
@@ -218,35 +243,86 @@ client.on('interactionCreate', async (interaction) => {
 
       if (interaction.customId === 'wb:w:size') {
         st.teamSize = interaction.values[0];
-        await interaction.update({
+        return interaction.update({
           content: `🧭 **War Wizard** — **War ID ${st.warId}**\nTeam Size: **${st.teamSize || '—'}** | Format: **${st.format || '—'}**\nSelect both, then click **Next**.`,
           components: [teamSizeMenu(st.teamSize), formatMenu(st.format), navButtons(!!(st.teamSize && st.format))],
         });
-        return;
       }
+
       if (interaction.customId === 'wb:w:format') {
         st.format = interaction.values[0];
-        await interaction.update({
+        return interaction.update({
           content: `🧭 **War Wizard** — **War ID ${st.warId}**\nTeam Size: **${st.teamSize || '—'}** | Format: **${st.format || '—'}**\nSelect both, then click **Next**.`,
           components: [teamSizeMenu(st.teamSize), formatMenu(st.format), navButtons(!!(st.teamSize && st.format))],
         });
-        return;
       }
-      if (interaction.customId === 'wb:w:time') {
-        const val = interaction.values[0]; // ms since epoch we stored
-        st.startET = slotLabelET(new Date(Number(val)));
-        await interaction.update({
-          content: `🧭 **War Wizard** — **War ID ${st.warId}**\nOpponent: **${st.opponent || '—'}**\nStart (ET): **${st.startET || '—'}**\nClick **Create Sign-up** to post or change the page/time below.`,
+
+      if (interaction.customId === 'wb:w:date') {
+        st.dateISO = interaction.values[0]; // YYYY-MM-DD (ET)
+        st.dateLabel = buildDateChoices7().find(o => o.value === st.dateISO)?.label || st.dateISO;
+        // If time already chosen, compose startET
+        if (st.timeLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
+        return interaction.update({
+          content:
+            `🧭 **War Wizard** — **War ID ${st.warId}**\n` +
+            `Opponent: **${st.opponent || '—'}**\n` +
+            `Date (ET): **${st.dateLabel || '—'}**\n` +
+            `Time (ET): **${st.timeLabel || '—'}**\n` +
+            `Enter opponent and select both date & time, then **Create Sign-up**.`,
           components: [
-            timeMenu(st.timePage, String(val)),
-            timePager(st.timePage),
+            dateMenu(st.dateISO),
+            timeMenu(st.timeValue),
             new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success),
+              new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success)
+                .setDisabled(!(st.opponent && st.dateISO && (st.timeValue || st.startET))),
               new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
             ),
           ],
         });
-        return;
+      }
+
+      if (interaction.customId === 'wb:w:clock') {
+        const val = interaction.values[0];
+        if (val === 'other') {
+          // Open modal for custom time (ET)
+          const modal = new ModalBuilder().setCustomId('wb:w:othertime').setTitle('Custom Time (ET)');
+          const txt = new TextInputBuilder()
+            .setCustomId('wb:w:othertxt')
+            .setLabel('Enter time in ET (e.g., "1:05 AM" or "13:05")')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(40);
+          modal.addComponents(new ActionRowBuilder().addComponents(txt));
+          await interaction.showModal(modal);
+          return;
+        }
+        // Regular band time
+        st.timeValue = val; // "HH:MM" 24h ET
+        // Turn label into 12-hour formatted display
+        const [H, M] = val.split(':').map(n => parseInt(n, 10));
+        const label = new Date(Date.UTC(2000, 0, 1, H, M)).toLocaleTimeString('en-US', {
+          hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
+        });
+        st.timeLabel = label;
+        if (st.dateLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
+
+        return interaction.update({
+          content:
+            `🧭 **War Wizard** — **War ID ${st.warId}**\n` +
+            `Opponent: **${st.opponent || '—'}**\n` +
+            `Date (ET): **${st.dateLabel || '—'}**\n` +
+            `Time (ET): **${st.timeLabel || '—'}**\n` +
+            `Enter opponent and select both date & time, then **Create Sign-up**.`,
+          components: [
+            dateMenu(st.dateISO),
+            timeMenu(st.timeValue),
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success)
+                .setDisabled(!(st.opponent && st.dateISO && (st.timeValue || st.startET))),
+              new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+            ),
+          ],
+        });
       }
     }
 
@@ -256,15 +332,11 @@ client.on('interactionCreate', async (interaction) => {
 
       if (interaction.customId === 'wb:w:cancel') {
         wizardState.delete(interaction.user.id);
-        await interaction.update({ content: '❌ Wizard cancelled.', components: [] });
-        return;
+        return interaction.update({ content: '❌ Wizard cancelled.', components: [] });
       }
 
       if (interaction.customId === 'wb:w:next') {
-        if (!st || !st.teamSize || !st.format) {
-          await interaction.reply({ content: 'Please choose team size and format first.', flags: 1 << 6 });
-          return;
-        }
+        if (!st || !st.teamSize || !st.format) return safeEphemeral(interaction, 'Please choose team size and format first.');
         const modal = new ModalBuilder().setCustomId('wb:w:oppmodal').setTitle('Enter Opponent');
         const opp = new TextInputBuilder()
           .setCustomId('wb:w:opptxt')
@@ -277,40 +349,16 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      if (interaction.customId === 'wb:w:tprev' || interaction.customId === 'wb:w:tnext') {
-        if (!st || !st.opponent) {
-          await interaction.reply({ content: 'Enter an opponent first.', flags: 1 << 6 });
-          return;
-        }
-        if (interaction.customId === 'wb:w:tprev' && st.timePage > 0) st.timePage -= 1;
-        if (interaction.customId === 'wb:w:tnext' && st.timePage < 5) st.timePage += 1;
-        await interaction.update({
-          content: `🧭 **War Wizard** — **War ID ${st.warId}**\nOpponent: **${st.opponent}**\nStart (ET): **${st.startET || '—'}**\nPick a time below (Page ${st.timePage+1}/6).`,
-          components: [
-            timeMenu(st.timePage, null),
-            timePager(st.timePage),
-            new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success).setDisabled(!st.startET),
-              new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
-            ),
-          ],
-        });
-        return;
-      }
-
       if (interaction.customId === 'wb:w:create') {
-        if (!st || !st.opponent || !st.startET) {
-          await interaction.reply({ content: 'Please enter opponent and pick a start time first.', flags: 1 << 6 });
-          return;
+        if (!st || !st.opponent || !st.dateISO || !(st.timeValue || st.startET)) {
+          return safeEphemeral(interaction, 'Please enter opponent and pick both date & time.');
         }
         const chId = process.env.WAR_CHANNEL_ID;
         const ch = chId ? await client.channels.fetch(chId).catch(()=>null) : null;
-        if (!ch || !ch.isTextBased()) {
-          await interaction.reply({ content: '❌ WAR_CHANNEL_ID is missing or invalid.', flags: 1 << 6 });
-          return;
-        }
+        if (!ch || !ch.isTextBased()) return safeEphemeral(interaction, '❌ WAR_CHANNEL_ID is missing or invalid.');
 
-        // Create embed
+        const startText = st.startET || `${st.dateLabel}, ${st.timeLabel} ET`;
+
         let embed = {
           title: `War Sign-up #${st.warId}`,
           description:
@@ -318,7 +366,7 @@ client.on('interactionCreate', async (interaction) => {
             `**Opponent:** ${st.opponent}\n` +
             `**Format:** ${st.format}\n` +
             `**Team Size:** ${st.teamSize}v${st.teamSize}\n` +
-            `**Start (ET):** ${st.startET}\n\n` +
+            `**Start (ET):** ${startText}\n\n` +
             `React 👍 to **join** (timestamp recorded).\nReact 👎 if you **cannot** play (opt-out).\nReact 🛑 to **cancel** this sign-up.`,
           footer: { text: `War #${st.warId}` }
         };
@@ -328,30 +376,28 @@ client.on('interactionCreate', async (interaction) => {
         warToMessage.set(String(st.warId), msg.id);
         pools.set(msg.id, { warId: st.warId, signups: new Map(), declines: new Map() });
 
-        // Write to Sheets (war created)
+        // Sheets log
         pushWarCreated({
           warId: st.warId,
           opponent: st.opponent,
           format: st.format,
           teamSize: st.teamSize,
-          startET: st.startET,
+          startET: startText,
           channelId: ch.id,
           messageId: msg.id,
         }).catch(e => console.error('pushWarCreated error:', e));
 
-        // Reacts
         await msg.react('👍').catch(()=>{});
         await msg.react('👎').catch(()=>{});
         await msg.react('🛑').catch(()=>{});
 
-        await interaction.update({
+        wizardState.delete(interaction.user.id);
+        return interaction.update({
           content:
             `✅ **War Sign-up #${st.warId}** created in <#${ch.id}>.\n` +
-            `Opponent: **${st.opponent}** | Format: **${st.format}** | Team: **${st.teamSize}v${st.teamSize}** | Start: **${st.startET}**`,
+            `Opponent: **${st.opponent}** | Format: **${st.format}** | Team: **${st.teamSize}v${st.teamSize}** | Start: **${startText}**`,
           components: [],
         });
-        wizardState.delete(interaction.user.id);
-        return;
       }
     }
 
@@ -360,20 +406,51 @@ client.on('interactionCreate', async (interaction) => {
       const st = wizardState.get(interaction.user.id);
       if (!st) return;
       st.opponent = interaction.fields.getTextInputValue('wb:w:opptxt');
-      st.timePage = 0; // start at first page
-      await interaction.reply({
-        content: `🧭 **War Wizard** — **War ID ${st.warId}**\nOpponent: **${st.opponent}**\nPick a **Start Time (ET)** below (Page 1/6).`,
+      return interaction.reply({
+        content:
+          `🧭 **War Wizard** — **War ID ${st.warId}**\n` +
+          `Opponent: **${st.opponent}**\n` +
+          `Pick **Date** and **Time (ET)** below, then **Create Sign-up**.`,
         components: [
-          timeMenu(0, null),
-          timePager(0),
+          dateMenu(st.dateISO),
+          timeMenu(st.timeValue),
           new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success).setDisabled(true),
+            new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success)
+              .setDisabled(!(st.opponent && st.dateISO && (st.timeValue || st.startET))),
             new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
           ),
         ],
         flags: 1 << 6,
       });
-      return;
+    }
+
+    // Custom time modal (Other…)
+    if (interaction.isModalSubmit() && interaction.customId === 'wb:w:othertime') {
+      const st = wizardState.get(interaction.user.id);
+      if (!st) return;
+      const txt = interaction.fields.getTextInputValue('wb:w:othertxt').trim();
+      // Store as-is; user provided ET time. We’ll display with date if present.
+      st.timeValue = null; // not from dropdown
+      st.timeLabel = txt;
+      if (st.dateLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
+      await interaction.reply({
+        content:
+          `🧭 **War Wizard** — **War ID ${st.warId}**\n` +
+          `Opponent: **${st.opponent || '—'}**\n` +
+          `Date (ET): **${st.dateLabel || '—'}**\n` +
+          `Time (ET): **${st.timeLabel || '—'}**\n` +
+          `Select both date & time, then **Create Sign-up**.`,
+        components: [
+          dateMenu(st.dateISO),
+          timeMenu(null),
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('wb:w:create').setLabel('Create Sign-up').setStyle(ButtonStyle.Success)
+              .setDisabled(!(st.opponent && st.dateISO && (st.timeLabel || st.timeValue))),
+            new ButtonBuilder().setCustomId('wb:w:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+          ),
+        ],
+        flags: 1 << 6,
+      });
     }
 
   } catch (e) {
@@ -383,7 +460,7 @@ client.on('interactionCreate', async (interaction) => {
         if (!interaction.replied && !interaction.deferred) {
           await interaction.reply({ content: '⚠️ Something went wrong.', flags: 1 << 6 });
         } else {
-          await interaction.editReply?.({ content: '⚠️ Something went wrong.' });
+          await interaction.followUp?.({ content: '⚠️ Something went wrong.', flags: 1 << 6 });
         }
       }
     } catch {}
@@ -396,7 +473,6 @@ async function updateSignupEmbed(msg, pool) {
   const yesLines = formatLines(pool.signups);
   const noLines  = formatLines(pool.declines);
 
-  // Remove old blocks and append fresh blocks
   base.description = base.description
     .replace(/\n?\*\*Joined.*$/s, '')
     .replace(/\n?\*\*Not participating.*$/s, '');
@@ -467,7 +543,7 @@ client.on('messageReactionRemove', async (reaction, user) => {
 client.once('clientReady', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   await initSheets();
-  initDB(); // no-op today; here for future stats
+  initDB(); // no-op
   await registerCommands();
 });
 
