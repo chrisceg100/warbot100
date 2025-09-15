@@ -1,4 +1,4 @@
-// index.js — WarBot (stable wizard + evening-only time menu)
+// index.js — WarBot (stable wizard, safer interaction flow)
 import 'dotenv/config';
 import http from 'http';
 import {
@@ -11,7 +11,7 @@ import {
 import { initSheets, getNextWarId, pushWarCreated, pushResponse } from './sheets.js';
 import { initDB } from './db.js';
 
-/* ------------------- tiny health server (Render-safe) ------------------- */
+/* ------------------- health server for Render (optional) ------------------- */
 const PORT = Number(process.env.PORT);
 if (Number.isFinite(PORT) && PORT > 0) {
   http.createServer((_, res) => { res.writeHead(200); res.end('OK'); })
@@ -20,7 +20,7 @@ if (Number.isFinite(PORT) && PORT > 0) {
   console.log('ℹ️ No PORT provided; skipping HTTP listener (OK for Background Worker).');
 }
 
-/* ----------------------------- state ------------------------------------ */
+/* ----------------------------- in-memory state ----------------------------- */
 // per-user wizard state
 const wiz = new Map();
 /** pools[msgId] = { warId, signups: Map<userId,{name,tsMs}>, declines: Map<userId,{name,tsMs}> } */
@@ -28,14 +28,15 @@ const pools = new Map();
 /** warId -> messageId (for /warbot cancel) */
 const warToMessage = new Map();
 
-/* ---------------------------- helpers ----------------------------------- */
+/* ------------------------------- helpers ---------------------------------- */
 async function registerCommands() {
   const cmds = [
     new SlashCommandBuilder()
       .setName('warbot')
       .setDescription('WarBot controls')
       .addSubcommand(s => s.setName('new').setDescription('Create a War Sign-up'))
-      .addSubcommand(s => s.setName('cancel').setDescription('Cancel a War Sign-up by War ID')
+      .addSubcommand(s => s.setName('cancel')
+        .setDescription('Cancel a War Sign-up by War ID')
         .addIntegerOption(o => o.setName('war_id').setDescription('War ID to cancel').setRequired(true)))
   ].map(c => c.toJSON());
 
@@ -49,8 +50,8 @@ async function registerCommands() {
 
 function ensureWarEmbed(base, warId) {
   const title = base.title?.includes('#') ? base.title : `War Sign-up #${warId}`;
-  const descHasId = /\*\*War ID:\*\*/.test(base.description || '');
-  const description = descHasId ? base.description : `**War ID:** ${warId}\n${base.description ?? ''}`;
+  const hasId = /\*\*War ID:\*\*/.test(base.description || '');
+  const description = hasId ? base.description : `**War ID:** ${warId}\n${base.description ?? ''}`;
   return { ...base, title, description, footer: { text: `War #${warId}` } };
 }
 
@@ -81,7 +82,7 @@ function buildDateChoices7() {
   return opts;
 }
 
-// HARD-LOCKED EVENING TIMES: 4:30 PM → 11:30 PM ET (30-min steps) + “Other…”
+// EVENING ONLY: 4:30 PM → 11:30 PM ET (30-min steps) + “Other…”
 function buildTimeChoicesEvening() {
   const vals = [
     '16:30','17:00','17:30',
@@ -100,7 +101,7 @@ function buildTimeChoicesEvening() {
     return { label, value: v };
   });
   opts.push({ label: 'Other…', value: 'other' });
-  return opts; // <= 17 (Discord cap is 25)
+  return opts; // 17 options (Discord cap 25)
 }
 
 function summary(st) {
@@ -130,7 +131,8 @@ async function safeEphemeral(interaction, content) {
       await interaction.followUp({ content, flags: 1 << 6 });
     }
   } catch (e) {
-    console.warn('safeEphemeral error:', e?.code || e?.message || e);
+    // Ignore stale token / double reply
+    if (e?.code !== 10062 && e?.code !== 40060) console.warn('safeEphemeral error:', e?.code || e);
   }
 }
 
@@ -187,7 +189,7 @@ const opponentButtons = (hasOpponent, ready) =>
     new ButtonBuilder().setCustomId('wb:cancelwiz').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
   );
 
-/* ----------------------------- client ------------------------------------ */
+/* -------------------------------- client --------------------------------- */
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -202,9 +204,10 @@ client.on('interactionCreate', async (interaction) => {
   try {
     // /warbot new
     if (interaction.isChatInputCommand() && interaction.commandName === 'warbot' && interaction.options.getSubcommand() === 'new') {
-      await interaction.deferReply({ flags: 1 << 6 }); // ACK ASAP (prevents Unknown interaction)
+      // >>> ACKNOWLEDGE FIRST, BEFORE DOING ANYTHING SLOW <<<
+      await interaction.deferReply({ flags: 1 << 6 });
 
-      // war id (Sheets first, timestamp fallback)
+      // get war id (Sheets preferred, fallback to UTC timestamp)
       let warId;
       try { warId = await getNextWarId(); } catch { warId = null; }
       if (!Number.isInteger(warId)) {
@@ -244,7 +247,7 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.editReply(`🛑 War Sign-up #${warId} cancelled and message removed.`);
     }
 
-    // Select menus
+    // select menus
     if (interaction.isStringSelectMenu()) {
       const st = wiz.get(interaction.user.id);
       if (!st) return;
@@ -289,7 +292,7 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // Buttons
+    // buttons
     if (interaction.isButton()) {
       const st = wiz.get(interaction.user.id);
 
@@ -313,8 +316,9 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (interaction.customId === 'wb:create') {
+        // we cannot reply here; we must either update or deferUpdate
+        await interaction.deferUpdate().catch(()=>{});
         if (!st || !canCreate(st)) {
-          await interaction.deferUpdate().catch(()=>{});
           await safeEphemeral(interaction, '❌ Missing info. Please complete all fields.');
           return;
         }
@@ -322,7 +326,6 @@ client.on('interactionCreate', async (interaction) => {
         const chId = process.env.WAR_CHANNEL_ID;
         const ch = chId ? await client.channels.fetch(chId).catch(()=>null) : null;
         if (!ch || !ch.isTextBased()) {
-          await interaction.deferUpdate().catch(()=>{});
           await safeEphemeral(interaction, '❌ WAR_CHANNEL_ID is missing or invalid.');
           return;
         }
@@ -360,13 +363,12 @@ client.on('interactionCreate', async (interaction) => {
         await msg.react('🛑').catch(()=>{});
 
         wiz.delete(interaction.user.id);
-        await interaction.deferUpdate().catch(()=>{});
         await safeEphemeral(interaction, `✅ Created **War Sign-up #${st.warId}** in <#${ch.id}>.`);
         return;
       }
     }
 
-    // Modals
+    // modals
     if (interaction.isModalSubmit()) {
       if (interaction.customId === 'wb:opp:modal') {
         const st = wiz.get(interaction.user.id);
@@ -374,7 +376,7 @@ client.on('interactionCreate', async (interaction) => {
         st.opponent = interaction.fields.getTextInputValue('opp').trim();
         const ready = canCreate(st);
 
-        // refresh wizard message
+        // try to edit the wizard message (it might be gone if redeployed)
         try {
           const ch = await client.channels.fetch(st.channelId);
           const msg = await ch.messages.fetch(st.wizardMessageId);
@@ -425,7 +427,6 @@ async function refreshSignupEmbed(msg, pool) {
   let base = msg.embeds[0]?.toJSON?.() || { title: `War Sign-up #${pool.warId}`, description: '' };
   const yes = linesFrom(pool.signups);
   const no  = linesFrom(pool.declines);
-  // remove old sections then append latest
   base.description = base.description
     .replace(/\n?\*\*Joined \(\d+\)\*[\s\S]*?(?=\n\*\*|$)/i, '')
     .replace(/\n?\*\*Not participating \(\d+\)\*[\s\S]*?(?=\n\*\*|$)/i, '');
@@ -487,7 +488,7 @@ client.on('messageReactionRemove', async (reaction, user) => {
   }
 });
 
-/* ---------------------------- boot --------------------------------------- */
+/* -------------------------------- boot ----------------------------------- */
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   await initSheets().catch(e => console.error('initSheets error:', e));
