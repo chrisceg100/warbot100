@@ -1,7 +1,4 @@
-// index.js — WarBot (evening-only time menu, stable wizard)
-// ENV: DISCORD_TOKEN, CLIENT_ID, GUILD_ID, WAR_CHANNEL_ID
-// Hooks expected: sheets.js -> initSheets,getNextWarId,pushWarCreated,pushResponse
-//                  db.js     -> initDB
+// index.js — WarBot (stable wizard + evening-only time menu)
 import 'dotenv/config';
 import http from 'http';
 import {
@@ -14,24 +11,42 @@ import {
 import { initSheets, getNextWarId, pushWarCreated, pushResponse } from './sheets.js';
 import { initDB } from './db.js';
 
-/* ---------- tiny health server (ignored if no PORT) ---------- */
+/* ------------------- tiny health server (Render-safe) ------------------- */
 const PORT = Number(process.env.PORT);
 if (Number.isFinite(PORT) && PORT > 0) {
   http.createServer((_, res) => { res.writeHead(200); res.end('OK'); })
       .listen(PORT, '0.0.0.0', () => console.log(`🌐 Health :${PORT}`));
 } else {
-  console.log('ℹ️ No PORT provided; skipping HTTP listener (Background Worker OK).');
+  console.log('ℹ️ No PORT provided; skipping HTTP listener (OK for Background Worker).');
 }
 
-/* ---------- state ---------- */
-// per-user wizard
+/* ----------------------------- state ------------------------------------ */
+// per-user wizard state
 const wiz = new Map();
 /** pools[msgId] = { warId, signups: Map<userId,{name,tsMs}>, declines: Map<userId,{name,tsMs}> } */
 const pools = new Map();
-/** warId -> messageId */
+/** warId -> messageId (for /warbot cancel) */
 const warToMessage = new Map();
 
-/* ---------- utils ---------- */
+/* ---------------------------- helpers ----------------------------------- */
+async function registerCommands() {
+  const cmds = [
+    new SlashCommandBuilder()
+      .setName('warbot')
+      .setDescription('WarBot controls')
+      .addSubcommand(s => s.setName('new').setDescription('Create a War Sign-up'))
+      .addSubcommand(s => s.setName('cancel').setDescription('Cancel a War Sign-up by War ID')
+        .addIntegerOption(o => o.setName('war_id').setDescription('War ID to cancel').setRequired(true)))
+  ].map(c => c.toJSON());
+
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  await rest.put(
+    Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
+    { body: cmds }
+  );
+  console.log('✅ Registered /warbot commands');
+}
+
 function ensureWarEmbed(base, warId) {
   const title = base.title?.includes('#') ? base.title : `War Sign-up #${warId}`;
   const descHasId = /\*\*War ID:\*\*/.test(base.description || '');
@@ -66,8 +81,7 @@ function buildDateChoices7() {
   return opts;
 }
 
-// ***** HARD-LOCKED EVENING TIMES *****
-// 4:30 PM → 11:30 PM ET in 30-min steps + “Other…”
+// HARD-LOCKED EVENING TIMES: 4:30 PM → 11:30 PM ET (30-min steps) + “Other…”
 function buildTimeChoicesEvening() {
   const vals = [
     '16:30','17:00','17:30',
@@ -86,7 +100,7 @@ function buildTimeChoicesEvening() {
     return { label, value: v };
   });
   opts.push({ label: 'Other…', value: 'other' });
-  return opts; // <= 17 options (Discord cap is 25)
+  return opts; // <= 17 (Discord cap is 25)
 }
 
 function summary(st) {
@@ -108,8 +122,19 @@ function linesFrom(map) {
     return `${v.name} (${dt} ET)`;
   }).join('\n');
 }
+async function safeEphemeral(interaction, content) {
+  try {
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.reply({ content, flags: 1 << 6 });
+    } else {
+      await interaction.followUp({ content, flags: 1 << 6 });
+    }
+  } catch (e) {
+    console.warn('safeEphemeral error:', e?.code || e?.message || e);
+  }
+}
 
-/* ---------- components ---------- */
+/* --------------------------- components ---------------------------------- */
 const teamSizeMenu = (selected) =>
   new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
@@ -162,26 +187,7 @@ const opponentButtons = (hasOpponent, ready) =>
     new ButtonBuilder().setCustomId('wb:cancelwiz').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
   );
 
-/* ---------- commands ---------- */
-async function registerCommands() {
-  const cmds = [
-    new SlashCommandBuilder()
-      .setName('warbot')
-      .setDescription('WarBot controls')
-      .addSubcommand(s => s.setName('new').setDescription('Create a War Sign-up'))
-      .addSubcommand(s => s.setName('cancel').setDescription('Cancel a War Sign-up by War ID')
-        .addIntegerOption(o => o.setName('war_id').setDescription('War ID to cancel').setRequired(true)))
-  ].map(c => c.toJSON());
-
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  await rest.put(
-    Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-    { body: cmds }
-  );
-  console.log('✅ Registered /warbot commands');
-}
-
-/* ---------- client ---------- */
+/* ----------------------------- client ------------------------------------ */
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -191,14 +197,14 @@ const client = new Client({
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
-/* ---------- interactions ---------- */
+/* -------------------------- interaction flow ----------------------------- */
 client.on('interactionCreate', async (interaction) => {
   try {
     // /warbot new
     if (interaction.isChatInputCommand() && interaction.commandName === 'warbot' && interaction.options.getSubcommand() === 'new') {
-      await interaction.reply({ content: '⏳ Preparing setup…', flags: 1 << 6 });
+      await interaction.deferReply({ flags: 1 << 6 }); // ACK ASAP (prevents Unknown interaction)
 
-      // War ID from Sheets; fallback to timestamp pattern if needed
+      // war id (Sheets first, timestamp fallback)
       let warId;
       try { warId = await getNextWarId(); } catch { warId = null; }
       if (!Number.isInteger(warId)) {
@@ -226,7 +232,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // /warbot cancel
     if (interaction.isChatInputCommand() && interaction.commandName === 'warbot' && interaction.options.getSubcommand() === 'cancel') {
-      await interaction.reply({ content: '⏳ Cancelling…', flags: 1 << 6 });
+      await interaction.deferReply({ flags: 1 << 6 });
       const warId = interaction.options.getInteger('war_id', true);
       const msgId = warToMessage.get(String(warId));
       if (!msgId) return interaction.editReply(`❌ No active sign-up for War ID ${warId}.`);
@@ -238,7 +244,7 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.editReply(`🛑 War Sign-up #${warId} cancelled and message removed.`);
     }
 
-    // Menus
+    // Select menus
     if (interaction.isStringSelectMenu()) {
       const st = wiz.get(interaction.user.id);
       if (!st) return;
@@ -308,13 +314,16 @@ client.on('interactionCreate', async (interaction) => {
 
       if (interaction.customId === 'wb:create') {
         if (!st || !canCreate(st)) {
-          await interaction.update({ content: '❌ Missing info. Please complete all fields.', components: [] });
+          await interaction.deferUpdate().catch(()=>{});
+          await safeEphemeral(interaction, '❌ Missing info. Please complete all fields.');
           return;
         }
+
         const chId = process.env.WAR_CHANNEL_ID;
         const ch = chId ? await client.channels.fetch(chId).catch(()=>null) : null;
         if (!ch || !ch.isTextBased()) {
-          await interaction.update({ content: '❌ WAR_CHANNEL_ID is missing or invalid.', components: [] });
+          await interaction.deferUpdate().catch(()=>{});
+          await safeEphemeral(interaction, '❌ WAR_CHANNEL_ID is missing or invalid.');
           return;
         }
 
@@ -351,10 +360,8 @@ client.on('interactionCreate', async (interaction) => {
         await msg.react('🛑').catch(()=>{});
 
         wiz.delete(interaction.user.id);
-        await interaction.update({
-          content: `✅ Created **War Sign-up #${st.warId}** in <#${ch.id}>.\n${summary(st)}`,
-          components: []
-        });
+        await interaction.deferUpdate().catch(()=>{});
+        await safeEphemeral(interaction, `✅ Created **War Sign-up #${st.warId}** in <#${ch.id}>.`);
         return;
       }
     }
@@ -367,6 +374,7 @@ client.on('interactionCreate', async (interaction) => {
         st.opponent = interaction.fields.getTextInputValue('opp').trim();
         const ready = canCreate(st);
 
+        // refresh wizard message
         try {
           const ch = await client.channels.fetch(st.channelId);
           const msg = await ch.messages.fetch(st.wizardMessageId);
@@ -375,7 +383,7 @@ client.on('interactionCreate', async (interaction) => {
             components: [teamSizeMenu(st.teamSize), formatMenu(st.format), dateMenu(st.dateISO), timeMenu(st.timeValue), opponentButtons(!!st.opponent, ready)]
           });
         } catch {}
-        await interaction.reply({ content: '✅ Opponent set.', flags: 1 << 6 });
+        await safeEphemeral(interaction, '✅ Opponent set.');
         return;
       }
 
@@ -396,7 +404,7 @@ client.on('interactionCreate', async (interaction) => {
             components: [teamSizeMenu(st.teamSize), formatMenu(st.format), dateMenu(st.dateISO), timeMenu(null), opponentButtons(!!st.opponent, ready)]
           });
         } catch {}
-        await interaction.reply({ content: '✅ Time set.', flags: 1 << 6 });
+        await safeEphemeral(interaction, '✅ Time set.');
         return;
       }
     }
@@ -412,11 +420,12 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-/* ---------- reactions ---------- */
+/* ------------------------ reaction tracking ------------------------------ */
 async function refreshSignupEmbed(msg, pool) {
   let base = msg.embeds[0]?.toJSON?.() || { title: `War Sign-up #${pool.warId}`, description: '' };
   const yes = linesFrom(pool.signups);
   const no  = linesFrom(pool.declines);
+  // remove old sections then append latest
   base.description = base.description
     .replace(/\n?\*\*Joined \(\d+\)\*[\s\S]*?(?=\n\*\*|$)/i, '')
     .replace(/\n?\*\*Not participating \(\d+\)\*[\s\S]*?(?=\n\*\*|$)/i, '');
@@ -478,9 +487,8 @@ client.on('messageReactionRemove', async (reaction, user) => {
   }
 });
 
-/* ---------- boot ---------- */
-const clientReadyName = 'clientReady'; // appease v15 deprecation warning
-client.once(clientReadyName, async () => {
+/* ---------------------------- boot --------------------------------------- */
+client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   await initSheets().catch(e => console.error('initSheets error:', e));
   initDB();
