@@ -1,4 +1,4 @@
-// index.js — WarBot (static time labels, safer interactions)
+// index.js — WarBot (static time labels; opponent-modal enable fix)
 import 'dotenv/config';
 import http from 'http';
 import {
@@ -64,7 +64,6 @@ function buildDateChoices7() {
       weekday: 'short', month: 'short', day: 'numeric',
       timeZone: 'America/New_York'
     });
-    // store a simple YYYY-MM-DD as value (string)
     const value = new Intl.DateTimeFormat('en-CA', {
       year: 'numeric', month: '2-digit', day: '2-digit',
       timeZone: 'America/New_York'
@@ -74,12 +73,25 @@ function buildDateChoices7() {
   return opts;
 }
 
-// STATIC TEXT LABELS — no timezone math, exactly what the user sees
+// STATIC TEXT LABELS — exactly what users see (no timezone math)
 function buildTimeChoicesEvening() {
   return [
     { label: '4:30 PM ET', value: '430pm' },
     { label: '5:00 PM ET', value: '500pm' },
-    { label: '5:30 PM ET', value: '530pm' }
+    { label: '5:30 PM ET', value: '530pm' },
+    { label: '6:00 PM ET', value: '600pm' },
+    { label: '6:30 PM ET', value: '630pm' },
+    { label: '7:00 PM ET', value: '700pm' },
+    { label: '7:30 PM ET', value: '730pm' },
+    { label: '8:00 PM ET', value: '800pm' },
+    { label: '8:30 PM ET', value: '830pm' },
+    { label: '9:00 PM ET', value: '900pm' },
+    { label: '9:30 PM ET', value: '930pm' },
+    { label: '10:00 PM ET', value: '1000pm' },
+    { label: '10:30 PM ET', value: '1030pm' },
+    { label: '11:00 PM ET', value: '1100pm' },
+    { label: '11:30 PM ET', value: '1130pm' },
+    { label: 'SUPERLATENIGHT', value: 'superlatenight' },
   ];
 }
 
@@ -157,7 +169,7 @@ const timeMenu = (selectedValue) => {
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId('wb:time')
-      .setPlaceholder('Pick time (ET): 4:30 / 5:00 / 5:30 PM')
+      .setPlaceholder('Pick time (ET)')
       .addOptions(...opts)
   );
 };
@@ -184,10 +196,8 @@ client.on('interactionCreate', async (interaction) => {
   try {
     // /warbot new
     if (interaction.isChatInputCommand() && interaction.commandName === 'warbot' && interaction.options.getSubcommand() === 'new') {
-      // Acknowledge immediately to avoid "Unknown interaction"
       await interaction.deferReply({ flags: 1 << 6 });
 
-      // war id from Sheets (fallback to UTC timestamp if unavailable)
       let warId;
       try { warId = await getNextWarId(); } catch { warId = null; }
       if (!Number.isInteger(warId)) {
@@ -338,9 +348,10 @@ client.on('interactionCreate', async (interaction) => {
         const st = wiz.get(interaction.user.id);
         if (!st) return;
         st.opponent = interaction.fields.getTextInputValue('opp').trim();
+
         const ready = canCreate(st);
 
-        // try to edit the wizard message (it might be gone if redeployed)
+        // Update the wizard message so the Create button state refreshes
         try {
           const ch = await client.channels.fetch(st.channelId);
           const msg = await ch.messages.fetch(st.wizardMessageId);
@@ -348,7 +359,9 @@ client.on('interactionCreate', async (interaction) => {
             content: `🧭 **War Setup** — **War ID ${st.warId}**\n${summary(st)}`,
             components: [teamSizeMenu(st.teamSize), formatMenu(st.format), dateMenu(st.dateISO), timeMenu(st.timeValue), opponentButtons(!!st.opponent, ready)]
           });
-        } catch {}
+        } catch (e) {
+          console.warn('wizard message edit failed (opp set):', e?.code || e);
+        }
         await safeEphemeral(interaction, '✅ Opponent set.');
         return;
       }
