@@ -1,8 +1,8 @@
-// index.js — WarBot (single-page setup)
-// Env needed: DISCORD_TOKEN, CLIENT_ID, GUILD_ID, WAR_CHANNEL_ID (+ Sheets envs)
+// index.js — WarBot (single-page setup, evening-only times)
+// ENV: DISCORD_TOKEN, CLIENT_ID, GUILD_ID, WAR_CHANNEL_ID (+ Sheets envs)
 // Optional: BUILD_NAME, PORT
-process.on('unhandledRejection', e => console.error('UNHANDLED REJECTION:', e));
-process.on('uncaughtException', e => console.error('UNCAUGHT EXCEPTION:', e));
+process.on('unhandledRejection', (e) => console.error('UNHANDLED REJECTION:', e));
+process.on('uncaughtException',  (e) => console.error('UNCAUGHT EXCEPTION:', e));
 
 import 'dotenv/config';
 import http from 'http';
@@ -30,9 +30,9 @@ if (Number.isFinite(PORT) && PORT > 0) {
   console.log('ℹ️ No PORT provided; skipping HTTP listener (OK for Background Worker).');
 }
 
-/* ------------------- State ------------------- */
-/** Setup wizard state per user */
-const state = new Map();
+/* ------------------- In-memory state ------------------- */
+/** Setup wizard per userID */
+const wiz = new Map();
 /** pools[msgId] = { warId, signups: Map<userId,{name,tsMs}>, declines: Map<userId,{name,tsMs}> } */
 const pools = new Map();
 /** warId -> messageId */
@@ -51,15 +51,20 @@ function ensureWarEmbed(base, warId) {
 function etAddDays(days) {
   const now = new Date();
   const d = new Date(now.getTime() + days * 86400000);
-  d.setUTCHours(16, 0, 0, 0); // anchor roughly mid-day ET for stable label
+  d.setUTCHours(16, 0, 0, 0); // anchor so label is stable
   return d;
 }
 function etDateLabel(d) {
-  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/New_York' });
+  return d.toLocaleDateString('en-US', {
+    weekday: 'short', month: 'short', day: 'numeric',
+    timeZone: 'America/New_York'
+  });
 }
 function etYYYYMMDD(d) {
-  return new Intl.DateTimeFormat('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit', timeZone: 'America/New_York' })
-    .format(d);
+  return new Intl.DateTimeFormat('en-CA', {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    timeZone: 'America/New_York'
+  }).format(d);
 }
 function buildDateChoices7() {
   const opts = [];
@@ -69,23 +74,25 @@ function buildDateChoices7() {
   }
   return opts;
 }
+
+// *** Evening-only times: 4:30 PM → 11:30 PM ET (30-min steps) ***
 function buildTimeChoicesEvening() {
-  // 4:30 PM (16:30) ET to 11:30 PM (23:30) ET, 30-min steps, then "Other…"
   const times = [];
   let hour = 16, min = 30;
   while (hour < 23 || (hour === 23 && min <= 30)) {
     const label = new Date(Date.UTC(2000, 0, 1, hour, min)).toLocaleTimeString('en-US', {
       hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
     });
-    const value = `${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+    const value = `${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}`; // e.g., "16:30"
     times.push({ label, value });
     min += 30;
     if (min >= 60) { min = 0; hour += 1; }
   }
   times.push({ label: 'Other…', value: 'other' });
-  return times;
+  return times; // 16 options incl. Other (well under Discord limit of 25)
 }
 
+/* ----- UI builders ----- */
 function teamSizeMenu(selected) {
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
@@ -119,7 +126,11 @@ function dateMenu(selectedValue) {
   );
 }
 function timeMenu(selectedValue) {
-  const opts = buildTimeChoicesEvening().map(o => ({ ...o, default: selectedValue === o.value }));
+  const opts = buildTimeChoicesEvening().map(o => ({
+    label: o.label,
+    value: o.value,
+    default: selectedValue === o.value
+  }));
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId('wb:time')
@@ -190,7 +201,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isChatInputCommand() && interaction.commandName === 'warbot' && interaction.options.getSubcommand() === 'new') {
       await interaction.reply({ content: '⏳ Preparing setup…', flags: 1 << 6 });
 
-      // reserve War ID
+      // Reserve War ID (fall back to timestamp if Sheets helper unavailable)
       let warId;
       try { warId = await getNextWarId(); } catch { warId = null; }
       if (!Number.isInteger(warId)) {
@@ -198,7 +209,7 @@ client.on('interactionCreate', async (interaction) => {
         warId = Number(`${n.getUTCFullYear()}${String(n.getUTCMonth()+1).padStart(2,'0')}${String(n.getUTCDate()).padStart(2,'0')}${String(n.getUTCHours()).padStart(2,'0')}${String(n.getUTCMinutes()).padStart(2,'0')}`);
       }
 
-      state.set(interaction.user.id, {
+      wiz.set(interaction.user.id, {
         warId, opponent: null, teamSize: null, format: null,
         dateISO: null, dateLabel: null, timeValue: null, timeLabel: null, startET: null
       });
@@ -207,7 +218,7 @@ client.on('interactionCreate', async (interaction) => {
         content:
           `🧭 **War Setup** (single page) — **War ID ${warId}**\n` +
           `1) Set opponent  2) Pick team size & format  3) Choose date/time  4) Create sign-up\n\n` +
-          summary(state.get(interaction.user.id)),
+          summary(wiz.get(interaction.user.id)),
         components: [teamSizeMenu(), formatMenu(), dateMenu(), timeMenu(), opponentButtons(false, false)]
       });
       return;
@@ -233,7 +244,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // Select menus
     if (interaction.isStringSelectMenu()) {
-      const st = state.get(interaction.user.id);
+      const st = wiz.get(interaction.user.id);
       if (!st) return;
 
       if (interaction.customId === 'wb:size') {
@@ -249,7 +260,7 @@ client.on('interactionCreate', async (interaction) => {
         if (st.timeLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
       } else if (interaction.customId === 'wb:time') {
         if (interaction.values[0] === 'other') {
-          // show modal (no defer first)
+          // show modal (do NOT defer first)
           const modal = new ModalBuilder().setCustomId('wb:time:other').setTitle('Custom Time (ET)');
           const txt = new TextInputBuilder()
             .setCustomId('othertime')
@@ -282,11 +293,11 @@ client.on('interactionCreate', async (interaction) => {
 
     // Buttons
     if (interaction.isButton()) {
-      const st = state.get(interaction.user.id);
+      const st = wiz.get(interaction.user.id);
 
       if (interaction.customId === 'wb:cancelwiz') {
         await interaction.deferUpdate();
-        state.delete(interaction.user.id);
+        wiz.delete(interaction.user.id);
         await interaction.editReply({ content: '❌ Setup cancelled.', components: [] });
         return;
       }
@@ -300,7 +311,7 @@ client.on('interactionCreate', async (interaction) => {
           .setRequired(true)
           .setMaxLength(50);
         modal.addComponents(new ActionRowBuilder().addComponents(opp));
-        await interaction.showModal(modal); // do not defer first
+        await interaction.showModal(modal); // no defer before showModal
         return;
       }
 
@@ -354,14 +365,14 @@ client.on('interactionCreate', async (interaction) => {
           components: [],
         });
 
-        state.delete(interaction.user.id);
+        wiz.delete(interaction.user.id);
         return;
       }
     }
 
     // Modals
     if (interaction.isModalSubmit() && interaction.customId === 'wb:opp:modal') {
-      const st = state.get(interaction.user.id);
+      const st = wiz.get(interaction.user.id);
       if (!st) return;
       const opponent = interaction.fields.getTextInputValue('opp').trim();
       const ready = canCreate({ ...st, opponent });
@@ -384,7 +395,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.isModalSubmit() && interaction.customId === 'wb:time:other') {
-      const st = state.get(interaction.user.id);
+      const st = wiz.get(interaction.user.id);
       if (!st) return;
       const txt = interaction.fields.getTextInputValue('othertime').trim();
       st.timeValue = null;
@@ -428,7 +439,7 @@ async function refreshSignupEmbed(msg, pool) {
   const yes = linesFrom(pool.signups);
   const no  = linesFrom(pool.declines);
 
-  // Remove old sections, then append fresh lists
+  // Strip old sections, then append fresh lists
   base.description = base.description
     .replace(/\n?\*\*Joined \(\d+\)\*[\s\S]*?(?=\n\*\*|$)/i, '')
     .replace(/\n?\*\*Not participating \(\d+\)\*[\s\S]*?(?=\n\*\*|$)/i, '');
@@ -497,7 +508,7 @@ client.on('messageReactionRemove', async (reaction, user) => {
 client.once('clientReady', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   await initSheets().catch(e => console.error('initSheets error:', e));
-  initDB(); // no-op if you’ve moved state to Sheets only; safe to keep
+  initDB(); // safe to call
   await registerCommands().catch(e => console.error('registerCommands error:', e));
 });
 client.login(process.env.DISCORD_TOKEN);
