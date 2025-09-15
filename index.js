@@ -74,22 +74,28 @@ function buildDateChoices7() {
   return opts;
 }
 
-// 4:30 PM (16:30) → 11:30 PM (23:30) ET, 30-min steps, plus "Other…"
+// 100% fixed list: 4:30 PM → 11:30 PM ET (30-min steps) + "Other…"
 function buildTimeChoicesEvening() {
-  const times = [];
-  let hour = 16, min = 30;
-  while (hour < 23 || (hour === 23 && min <= 30)) {
-    const label = new Date(Date.UTC(2000, 0, 1, hour, min)).toLocaleTimeString('en-US', {
+  const vals = [
+    '16:30','17:00','17:30',
+    '18:00','18:30',
+    '19:00','19:30',
+    '20:00','20:30',
+    '21:00','21:30',
+    '22:00','22:30',
+    '23:00','23:30'
+  ];
+  const opts = vals.map(v => {
+    const [H, M] = v.split(':').map(n => parseInt(n, 10));
+    const label = new Date(Date.UTC(2000, 0, 1, H, M)).toLocaleTimeString('en-US', {
       hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
     });
-    const value = `${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
-    times.push({ label, value });
-    min += 30;
-    if (min >= 60) { min = 0; hour += 1; }
-  }
-  times.push({ label: 'Other…', value: 'other' });
-  return times; // <= 16 options -> well under Discord 25 cap
+    return { label, value: v };
+  });
+  opts.push({ label: 'Other…', value: 'other' });
+  return opts;
 }
+
 
 function summary(st) {
   return `**War ID:** ${st.warId}\n` +
