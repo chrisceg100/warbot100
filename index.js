@@ -82,17 +82,15 @@ function buildDateChoices7() {
   return opts;
 }
 
-// ONLY three evening choices in ET
+// Static text labels — no timezones
 function buildTimeChoicesEvening() {
-  const vals = ['16:30', '17:00', '17:30']; // 4:30, 5:00, 5:30 PM ET
-  return vals.map(v => {
-    const [H, M] = v.split(':').map(n => parseInt(n, 10));
-    const label = new Date(Date.UTC(2000, 0, 1, H, M)).toLocaleTimeString('en-US', {
-      hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
-    });
-    return { label: `${label} ET`, value: v };
-  });
+  return [
+    { label: '4:30 PM ET', value: '430pm' },
+    { label: '5:00 PM ET', value: '500pm' },
+    { label: '5:30 PM ET', value: '530pm' }
+  ];
 }
+
 
 
 function summary(st) {
@@ -163,12 +161,14 @@ const dateMenu = (selectedValue) => {
 
 const timeMenu = (selectedValue) => {
   const opts = buildTimeChoicesEvening().map(o => ({
-    label: o.label, value: o.value, default: selectedValue === o.value
+    label: o.label,
+    value: o.value,
+    default: selectedValue === o.value
   }));
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId('wb:time')
-      .setPlaceholder('Pick time (ET): 4:30 / 5:00 / 5:30 PM')
+      .setPlaceholder('Pick time (ET)')
       .addOptions(...opts)
   );
 };
