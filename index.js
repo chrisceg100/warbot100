@@ -82,27 +82,18 @@ function buildDateChoices7() {
   return opts;
 }
 
-// EVENING ONLY: 4:30 PM → 11:30 PM ET (30-min steps) + “Other…”
+// ONLY three evening choices in ET
 function buildTimeChoicesEvening() {
-  const vals = [
-    '16:30','17:00','17:30',
-    '18:00','18:30',
-    '19:00','19:30',
-    '20:00','20:30',
-    '21:00','21:30',
-    '22:00','22:30',
-    '23:00','23:30'
-  ];
-  const opts = vals.map(v => {
+  const vals = ['16:30', '17:00', '17:30']; // 4:30, 5:00, 5:30 PM ET
+  return vals.map(v => {
     const [H, M] = v.split(':').map(n => parseInt(n, 10));
     const label = new Date(Date.UTC(2000, 0, 1, H, M)).toLocaleTimeString('en-US', {
       hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
     });
-    return { label, value: v };
+    return { label: `${label} ET`, value: v };
   });
-  opts.push({ label: 'Other…', value: 'other' });
-  return opts; // 17 options (Discord cap 25)
 }
+
 
 function summary(st) {
   return `**War ID:** ${st.warId}\n` +
@@ -177,10 +168,11 @@ const timeMenu = (selectedValue) => {
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId('wb:time')
-      .setPlaceholder('Pick time (ET) — 4:30 PM to 11:30 PM')
+      .setPlaceholder('Pick time (ET): 4:30 / 5:00 / 5:30 PM')
       .addOptions(...opts)
   );
 };
+
 
 const opponentButtons = (hasOpponent, ready) =>
   new ActionRowBuilder().addComponents(
