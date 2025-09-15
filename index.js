@@ -343,29 +343,35 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     // modals
-    if (interaction.isModalSubmit()) {
-      if (interaction.customId === 'wb:opp:modal') {
-        const st = wiz.get(interaction.user.id);
-        if (!st) return;
-        st.opponent = interaction.fields.getTextInputValue('opp').trim();
+    // --- replace your existing "if (interaction.isModalSubmit()) ..." block with this ---
+if (interaction.isModalSubmit()) {
+  if (interaction.customId === 'wb:opp:modal') {
+    const st = wiz.get(interaction.user.id);
+    if (!st) return;
 
-        const ready = canCreate(st);
+    st.opponent = interaction.fields.getTextInputValue('opp').trim();
+    const ready = !!(st.opponent && st.teamSize && st.format && st.dateLabel && st.timeLabel);
 
-        // Update the wizard message so the Create button state refreshes
-        try {
-          const ch = await client.channels.fetch(st.channelId);
-          const msg = await ch.messages.fetch(st.wizardMessageId);
-          await msg.edit({
-            content: `🧭 **War Setup** — **War ID ${st.warId}**\n${summary(st)}`,
-            components: [teamSizeMenu(st.teamSize), formatMenu(st.format), dateMenu(st.dateISO), timeMenu(st.timeValue), opponentButtons(!!st.opponent, ready)]
-          });
-        } catch (e) {
-          console.warn('wizard message edit failed (opp set):', e?.code || e);
-        }
-        await safeEphemeral(interaction, '✅ Opponent set.');
-        return;
-      }
-    }
+    // Send a NEW ephemeral wizard message (can’t edit the old ephemeral one reliably)
+    const newMsg = await interaction.reply({
+      content: `🧭 **War Setup** — **War ID ${st.warId}**\n${summary(st)}`,
+      components: [
+        teamSizeMenu(st.teamSize),
+        formatMenu(st.format),
+        dateMenu(st.dateISO),
+        timeMenu(st.timeValue),
+        opponentButtons(true, ready)
+      ],
+      flags: 1 << 6,            // ephemeral
+      fetchReply: true          // so we can store its id for subsequent selects
+    });
+
+    st.wizardMessageId = newMsg.id; // keep using the latest ephemeral message
+    await safeEphemeral(interaction, '✅ Opponent set.');
+    return;
+  }
+}
+
   } catch (e) {
     console.error('INTERACTION ERROR:', e);
     try {
