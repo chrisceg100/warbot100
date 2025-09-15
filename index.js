@@ -1,4 +1,4 @@
-// index.js — WarBot (stable wizard, safer interaction flow)
+// index.js — WarBot (static time labels, safer interactions)
 import 'dotenv/config';
 import http from 'http';
 import {
@@ -55,34 +55,26 @@ function ensureWarEmbed(base, warId) {
   return { ...base, title, description, footer: { text: `War #${warId}` } };
 }
 
-function etAddDays(days) {
-  const now = new Date();
-  const d = new Date(now.getTime() + days * 86400000);
-  d.setUTCMinutes(0, 0, 0);
-  return d;
-}
-function etDateLabel(d) {
-  return d.toLocaleDateString('en-US', {
-    weekday: 'short', month: 'short', day: 'numeric',
-    timeZone: 'America/New_York'
-  });
-}
-function etYYYYMMDD(d) {
-  return new Intl.DateTimeFormat('en-CA', {
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    timeZone: 'America/New_York'
-  }).format(d);
-}
 function buildDateChoices7() {
+  const now = new Date();
   const opts = [];
   for (let i = 0; i < 7; i++) {
-    const d = etAddDays(i);
-    opts.push({ label: etDateLabel(d), value: etYYYYMMDD(d) });
+    const d = new Date(now.getTime() + i * 86400000);
+    const label = d.toLocaleDateString('en-US', {
+      weekday: 'short', month: 'short', day: 'numeric',
+      timeZone: 'America/New_York'
+    });
+    // store a simple YYYY-MM-DD as value (string)
+    const value = new Intl.DateTimeFormat('en-CA', {
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      timeZone: 'America/New_York'
+    }).format(d);
+    opts.push({ label, value });
   }
   return opts;
 }
 
-// Static text labels — no timezones
+// STATIC TEXT LABELS — no timezone math, exactly what the user sees
 function buildTimeChoicesEvening() {
   return [
     { label: '4:30 PM ET', value: '430pm' },
@@ -91,15 +83,13 @@ function buildTimeChoicesEvening() {
   ];
 }
 
-
-
 function summary(st) {
   return `**War ID:** ${st.warId}\n` +
     `Opponent: **${st.opponent || '—'}**  |  Team: **${st.teamSize || '—'}v${st.teamSize || '—'}**  |  Format: **${st.format || '—'}**\n` +
     `Date: **${st.dateLabel || '—'}**  |  Time: **${st.timeLabel || '—'}**`;
 }
 function canCreate(st) {
-  return !!(st.opponent && st.teamSize && st.format && st.dateLabel && (st.timeLabel || st.timeValue));
+  return !!(st.opponent && st.teamSize && st.format && st.dateLabel && st.timeLabel);
 }
 function linesFrom(map) {
   const list = [...map.values()].sort((a,b) => a.tsMs - b.tsMs);
@@ -120,7 +110,6 @@ async function safeEphemeral(interaction, content) {
       await interaction.followUp({ content, flags: 1 << 6 });
     }
   } catch (e) {
-    // Ignore stale token / double reply
     if (e?.code !== 10062 && e?.code !== 40060) console.warn('safeEphemeral error:', e?.code || e);
   }
 }
@@ -168,11 +157,10 @@ const timeMenu = (selectedValue) => {
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId('wb:time')
-      .setPlaceholder('Pick time (ET)')
+      .setPlaceholder('Pick time (ET): 4:30 / 5:00 / 5:30 PM')
       .addOptions(...opts)
   );
 };
-
 
 const opponentButtons = (hasOpponent, ready) =>
   new ActionRowBuilder().addComponents(
@@ -196,10 +184,10 @@ client.on('interactionCreate', async (interaction) => {
   try {
     // /warbot new
     if (interaction.isChatInputCommand() && interaction.commandName === 'warbot' && interaction.options.getSubcommand() === 'new') {
-      // >>> ACKNOWLEDGE FIRST, BEFORE DOING ANYTHING SLOW <<<
+      // Acknowledge immediately to avoid "Unknown interaction"
       await interaction.deferReply({ flags: 1 << 6 });
 
-      // get war id (Sheets preferred, fallback to UTC timestamp)
+      // war id from Sheets (fallback to UTC timestamp if unavailable)
       let warId;
       try { warId = await getNextWarId(); } catch { warId = null; }
       if (!Number.isInteger(warId)) {
@@ -250,30 +238,15 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.customId === 'wb:date') {
         st.dateISO = interaction.values[0];
         st.dateLabel = buildDateChoices7().find(o => o.value === st.dateISO)?.label || st.dateISO;
-        if (st.timeLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
+        if (st.timeLabel) st.startET = `${st.dateLabel}, ${st.timeLabel}`;
       }
 
       if (interaction.customId === 'wb:time') {
-        if (interaction.values[0] === 'other') {
-          const modal = new ModalBuilder().setCustomId('wb:time:other').setTitle('Custom Time (ET)');
-          const txt = new TextInputBuilder()
-            .setCustomId('othertime')
-            .setLabel('Enter time in ET (e.g., "10:15 PM")')
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setMaxLength(40);
-          modal.addComponents(new ActionRowBuilder().addComponents(txt));
-          await interaction.showModal(modal);
-          return;
-        } else {
-          const val = interaction.values[0];
-          st.timeValue = val;
-          const [H, M] = val.split(':').map(n => parseInt(n, 10));
-          st.timeLabel = new Date(Date.UTC(2000, 0, 1, H, M)).toLocaleTimeString('en-US', {
-            hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
-          });
-          if (st.dateLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
-        }
+        const val = interaction.values[0];
+        const display = buildTimeChoicesEvening().find(o => o.value === val)?.label || val;
+        st.timeValue = val;
+        st.timeLabel = display; // store the exact text users saw
+        if (st.dateLabel) st.startET = `${st.dateLabel}, ${st.timeLabel}`;
       }
 
       const ready = canCreate(st);
@@ -308,7 +281,6 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (interaction.customId === 'wb:create') {
-        // we cannot reply here; we must either update or deferUpdate
         await interaction.deferUpdate().catch(()=>{});
         if (!st || !canCreate(st)) {
           await safeEphemeral(interaction, '❌ Missing info. Please complete all fields.');
@@ -322,7 +294,7 @@ client.on('interactionCreate', async (interaction) => {
           return;
         }
 
-        const startText = st.startET || `${st.dateLabel}, ${st.timeLabel} ET`;
+        const startText = st.startET || `${st.dateLabel}, ${st.timeLabel}`;
         let embed = {
           title: `War Sign-up #${st.warId}`,
           description:
@@ -378,27 +350,6 @@ client.on('interactionCreate', async (interaction) => {
           });
         } catch {}
         await safeEphemeral(interaction, '✅ Opponent set.');
-        return;
-      }
-
-      if (interaction.customId === 'wb:time:other') {
-        const st = wiz.get(interaction.user.id);
-        if (!st) return;
-        const txt = interaction.fields.getTextInputValue('othertime').trim();
-        st.timeValue = null;
-        st.timeLabel = txt;
-        if (st.dateLabel) st.startET = `${st.dateLabel}, ${st.timeLabel} ET`;
-        const ready = canCreate(st);
-
-        try {
-          const ch = await client.channels.fetch(st.channelId);
-          const msg = await ch.messages.fetch(st.wizardMessageId);
-          await msg.edit({
-            content: `🧭 **War Setup** — **War ID ${st.warId}**\n${summary(st)}`,
-            components: [teamSizeMenu(st.teamSize), formatMenu(st.format), dateMenu(st.dateISO), timeMenu(null), opponentButtons(!!st.opponent, ready)]
-          });
-        } catch {}
-        await safeEphemeral(interaction, '✅ Time set.');
         return;
       }
     }
