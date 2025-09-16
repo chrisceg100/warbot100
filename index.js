@@ -1,4 +1,4 @@
-// index.js — stable wizard with single ephemeral message + stop-sign cancel
+// index.js — stable wizard + live signup list with timestamps
 import 'dotenv/config';
 import {
   Client, GatewayIntentBits, Partials,
@@ -6,7 +6,7 @@ import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   StringSelectMenuBuilder, ModalBuilder,
   TextInputBuilder, TextInputStyle,
-  EmbedBuilder, MessageFlagsBitField,
+  EmbedBuilder, MessageFlagsBitField, PermissionsBitField,
 } from 'discord.js';
 
 const {
@@ -26,8 +26,10 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.MessageContent,
   ],
-  partials: [Partials.Message, Partials.Reaction, Partials.Channel],
+  partials: [Partials.Message, Partials.Reaction, Partials.Channel, Partials.User, Partials.GuildMember],
 });
 
 const EPHEMERAL = MessageFlagsBitField.Flags.Ephemeral;
@@ -35,8 +37,10 @@ const EPHEMERAL = MessageFlagsBitField.Flags.Ephemeral;
 // ---------- State ----------
 /** per-user wizard state */
 const wiz = new Map();
-/** simple in-memory War IDs (replace with DB later if you want persistence) */
+/** simple in-memory War IDs */
 let nextWarId = 1;
+/** live signup states keyed by message id */
+const signups = new Map(); // msgId -> { warId, teamSizeNum, opponent, format, dateLabel, timeLabel, users: Map<userId,{name,ts}>, backs: Set<userId>, notAvail:Set<userId> }
 
 // ---------- Static choices ----------
 const TEAM_SIZES = ['6v6','7v7','8v8'];
@@ -49,6 +53,7 @@ const TIME_OPTIONS = [
   'SUPERLATENIGHT',
 ];
 
+function sizeNum(str){ const m = String(str||'').match(/^(\d+)/); return m?parseInt(m[1],10):6; }
 function todayPlus(n) { const d = new Date(); d.setDate(d.getDate()+n); return d; }
 function dateISO(d){ return d.toISOString().slice(0,10); }
 function dateLabel(d){
@@ -151,25 +156,70 @@ async function registerCommands(){
   console.log('✅ Registered /warbot commands');
 }
 
+// ---------- Render sign-up embed with live lists ----------
+function renderSignupEmbed(state){
+  const starters = [];
+  const backups  = [];
+  const teamCap = state.teamSizeNum;
+
+  // Sort users by join time
+  const ordered = Array.from(state.users.entries())
+    .sort((a,b)=>a[1].ts - b[1].ts);
+
+  ordered.forEach(([uid, info], idx)=>{
+    const line = `• ${info.name} — <t:${info.ts}:t>`;
+    if (idx < teamCap) starters.push(line);
+    else backups.push(line);
+  });
+
+  const notAvail = Array.from(state.notAvail || []).map(uid=>{
+    const u = state.users.get(uid);
+    const name = u?.name || `User ${uid}`;
+    const ts = u?.ts || Math.floor(Date.now()/1000);
+    return `• ${name} — <t:${ts}:t>`;
+  });
+
+  const desc = [
+    `**Opponent:** ${state.opponent}`,
+    `**Team:** ${state.teamSizeNum}v${state.teamSizeNum}`,
+    `**Format:** ${state.format}`,
+    `**Start (ET):** ${state.dateLabel}, ${state.timeLabel}`,
+    '',
+    'React 👍 to join. Unreact 👍 to drop out.',
+    'React 👎 if you are not available.',
+    'React 🛑 to cancel the war (admins/keepers/captains only).',
+  ].join('\n');
+
+  const embed = new EmbedBuilder()
+    .setTitle(`War Sign-up — War #${state.warId}`)
+    .setDescription(desc)
+    .addFields(
+      { name: `Starters (${Math.min(starters.length, teamCap)}/${teamCap})`, value: starters.length? starters.join('\n') : '—', inline: false },
+      { name: `Backups (${Math.max(0, backups.length)})`, value: backups.length? backups.join('\n') : '—', inline: false },
+      { name: `Not Available (${notAvail.length})`, value: notAvail.length? notAvail.join('\n') : '—', inline: false },
+    )
+    .setColor(0x2b2d31);
+
+  return embed;
+}
+
 // ---------- Posting the sign-up ----------
 async function postSignup(st){
   const channel = await client.channels.fetch(WAR_CHANNEL_ID);
   if (!channel?.isTextBased()) throw new Error('Invalid WAR_CHANNEL_ID');
 
-  const embed = new EmbedBuilder()
-    .setTitle(`War Sign-up — War #${st.warId}`)
-    .setDescription([
-      `**Opponent:** ${st.opponent}`,
-      `**Team:** ${st.teamSize}`,
-      `**Format:** ${st.format}`,
-      `**Start (ET):** ${st.dateLabel}, ${st.timeLabel}`,
-      '',
-      'React 👍 to join. Unreact 👍 to drop out.',
-      'React 👎 if you are not available.',
-      'React 🛑 to cancel the war (admins/keepers/captains only).',
-    ].join('\n'))
-    .setColor(0x2b2d31);
+  const state = {
+    warId: st.warId,
+    teamSizeNum: sizeNum(st.teamSize),
+    opponent: st.opponent,
+    format: st.format,
+    dateLabel: st.dateLabel,
+    timeLabel: st.timeLabel,
+    users: new Map(),      // userId -> { name, ts }
+    notAvail: new Set(),   // userIds that clicked 👎
+  };
 
+  const embed = renderSignupEmbed(state);
   const content = PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : undefined;
   const msg = await channel.send({ content, embeds: [embed] });
 
@@ -178,13 +228,31 @@ async function postSignup(st){
   try { await msg.react('👎'); } catch {}
   try { await msg.react('🛑'); } catch {}
 
+  // store state
+  signups.set(msg.id, state);
+
   return msg.id;
+}
+
+// ---------- Helpers for reactions ----------
+async function updateSignupMessage(message){
+  const state = signups.get(message.id);
+  if (!state) return;
+  try{
+    const embed = renderSignupEmbed(state);
+    await message.edit({ embeds:[embed] });
+  }catch(e){ console.error('edit failed:', e?.code || e); }
+}
+
+function isWarChannel(message){
+  return message?.channelId === WAR_CHANNEL_ID;
 }
 
 // ---------- Client lifecycle ----------
 client.once('clientReady', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   try { await registerCommands(); } catch {}
+  console.log('✅ Google Sheets ready');
 });
 
 // ---------- Interaction handling ----------
@@ -193,7 +261,7 @@ client.on('interactionCreate', async (interaction) => {
     // /warbot new
     if (interaction.isChatInputCommand() && interaction.commandName === 'warbot' && interaction.options.getSubcommand() === 'new') {
       const st = {
-        root: interaction, // keep original interaction so we can edit the SAME ephemeral later
+        root: interaction, // keep original interaction to edit the SAME ephemeral
         warId: nextWarId++,
         opponent: '',
         teamSize: '6v6',
@@ -206,13 +274,13 @@ client.on('interactionCreate', async (interaction) => {
 
       await interaction.reply({
         content: `🧭 **War Setup — War ID ${st.warId}**\n${summary(st)}`,
-        components: components(st),
+        components: [teamMenu(st.teamSize), fmtMenu(st.format), dateMenu(st.dateISO), timeMenu(st.timeLabel), actionRow(false)],
         flags: EPHEMERAL,
       });
       return;
     }
 
-    // Dropdowns (these come from the same message, so we can update in-place)
+    // Dropdown updates
     if (interaction.isStringSelectMenu()) {
       const st = wiz.get(interaction.user.id);
       if (!st) return;
@@ -226,9 +294,10 @@ client.on('interactionCreate', async (interaction) => {
       }
       if (interaction.customId === 'wb:time') st.timeLabel = interaction.values[0];
 
+      const ready = !!(st.opponent && st.teamSize && st.format && st.dateLabel && st.timeLabel);
       await interaction.update({
         content: `🧭 **War Setup — War ID ${st.warId}**\n${summary(st)}`,
-        components: components(st),
+        components: [teamMenu(st.teamSize), fmtMenu(st.format), dateMenu(st.dateISO), timeMenu(st.timeLabel), actionRow(ready)],
         flags: EPHEMERAL,
       });
       return;
@@ -246,7 +315,6 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (interaction.customId === 'wb:opp') {
-        // Important: do NOT defer; show the modal immediately
         await interaction.showModal(opponentModal());
         return;
       }
@@ -275,23 +343,22 @@ client.on('interactionCreate', async (interaction) => {
 
       st.opponent = interaction.fields.getTextInputValue('opp').trim();
 
-      // Acknowledge the modal *and* edit the ORIGINAL wizard (no duplicate wizard views)
+      // acknowledge + edit original ephemeral wizard (no duplication)
       await interaction.reply({ content: '✅ Opponent set.', flags: EPHEMERAL });
-
       try {
+        const ready = !!(st.opponent && st.teamSize && st.format && st.dateLabel && st.timeLabel);
         await st.root.editReply({
           content: `🧭 **War Setup — War ID ${st.warId}**\n${summary(st)}`,
-          components: components(st),
+          components: [teamMenu(st.teamSize), fmtMenu(st.format), dateMenu(st.dateISO), timeMenu(st.timeLabel), actionRow(ready)],
         });
-      } catch (e) {
-        // Fallback: if edit fails for any reason, send a fresh wizard once
+      } catch {
+        // fallback in case original ephemeral is gone
+        st.root = interaction;
         await interaction.followUp({
-          content: `🧭 **War Setup — War ID ${st.warId}**\n${summary(st)}\n_(opened a new wizard view because the old one could not be edited)_`,
-          components: components(st),
+          content: `🧭 **War Setup — War ID ${st.warId}**\n${summary(st)}`,
+          components: [teamMenu(st.teamSize), fmtMenu(st.format), dateMenu(st.dateISO), timeMenu(st.timeLabel), actionRow(true)],
           flags: EPHEMERAL,
         });
-        // and update the root reference to allow future edits
-        st.root = interaction;
       }
       return;
     }
@@ -306,10 +373,91 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-client.login(DISCORD_TOKEN).then(async () => {
-  try { await registerCommands(); } catch {}
-  console.log('✅ Google Sheets ready'); // keeps your logs familiar
-}).catch((e)=>{
+// ---------- Reactions for live sign-ups ----------
+client.on('messageReactionAdd', async (reaction, user) => {
+  try {
+    if (user.bot) return;
+    if (reaction.partial) await reaction.fetch().catch(()=>{});
+    const message = reaction.message;
+    if (!isWarChannel(message)) return;
+    const state = signups.get(message.id);
+    if (!state) return;
+
+    // normalize emoji
+    const emoji = reaction.emoji.name;
+
+    if (emoji === '👍') {
+      state.notAvail.delete(user.id);
+      if (!state.users.has(user.id)) {
+        // fetch display name
+        let name = user.username;
+        try {
+          const member = await message.guild.members.fetch(user.id);
+          name = member?.displayName || user.username;
+        } catch {}
+        state.users.set(user.id, { name, ts: Math.floor(Date.now()/1000) });
+      }
+      await updateSignupMessage(message);
+    }
+    if (emoji === '👎') {
+      // mark not available
+      if (!state.users.has(user.id)) {
+        let name = user.username;
+        try {
+          const member = await message.guild.members.fetch(user.id);
+          name = member?.displayName || user.username;
+        } catch {}
+        state.users.set(user.id, { name, ts: Math.floor(Date.now()/1000) });
+      }
+      state.notAvail.add(user.id);
+      await updateSignupMessage(message);
+    }
+    if (emoji === '🛑') {
+      // Only allow if the user has ManageMessages or is admin
+      try {
+        const member = await message.guild.members.fetch(user.id);
+        const can = member.permissions.has(PermissionsBitField.Flags.ManageMessages) || member.permissions.has(PermissionsBitField.Flags.Administrator);
+        if (can) {
+          await message.delete().catch(()=>{});
+          signups.delete(message.id);
+        } else {
+          // remove their stop reaction silently
+          await reaction.users.remove(user.id).catch(()=>{});
+        }
+      } catch {}
+    }
+  } catch (e) {
+    console.error('reactionAdd err:', e?.code || e);
+  }
+});
+
+client.on('messageReactionRemove', async (reaction, user) => {
+  try {
+    if (user.bot) return;
+    if (reaction.partial) await reaction.fetch().catch(()=>{});
+    const message = reaction.message;
+    if (!isWarChannel(message)) return;
+    const state = signups.get(message.id);
+    if (!state) return;
+
+    const emoji = reaction.emoji.name;
+
+    if (emoji === '👍') {
+      // drop from users (and from notAvail just in case)
+      state.users.delete(user.id);
+      state.notAvail.delete(user.id);
+      await updateSignupMessage(message);
+    }
+    if (emoji === '👎') {
+      state.notAvail.delete(user.id);
+      await updateSignupMessage(message);
+    }
+  } catch (e) {
+    console.error('reactionRemove err:', e?.code || e);
+  }
+});
+
+client.login(DISCORD_TOKEN).catch((e)=>{
   console.error('Login failed:', e);
   process.exit(1);
 });
